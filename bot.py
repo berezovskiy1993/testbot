@@ -247,7 +247,7 @@ def main():
         listen="0.0.0.0",
         port=port,
         url_path=TOKEN,
-        webhook_url=f"https://clan-bot-2-1.onrender.com/{TOKEN}",
+        webhook_url=f"https://testbot-bovn.onrender.com/{TOKEN}",
     )
 
 if __name__ == "__main__":
