@@ -1,4 +1,5 @@
 import os
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, CallbackContext, CallbackQueryHandler
 
@@ -8,7 +9,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 GROUP_ID = -1002640250280  # основная группа для заявок
 EXTRA_GROUP_ID = -1002011191845  # дополнительная группа, куда тоже отправляется заявка
 
-# Этапы анкеты (нумеруются для использования ConversationHandler)
+# Этапы анкеты
 READY, NICKNAME, PLAYER_ID, AGE, GENDER, KD_CURRENT, MATCHES_CURRENT, SCREENSHOT_1, KD_PREVIOUS, MATCHES_PREVIOUS, SCREENSHOT_2 = range(11)
 
 # Список админов
@@ -30,7 +31,6 @@ def get_buttons():
          InlineKeyboardButton("Сначала", callback_data='reset_button')]
     ])
 
-# Кнопки меню
 def get_menu_buttons():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Критерии", callback_data='criteria_button')],
@@ -39,7 +39,7 @@ def get_menu_buttons():
         [InlineKeyboardButton("⬅ Назад", callback_data='back_button')]
     ])
 
-# Команда /start — начало анкеты
+# Команда /start
 async def start(update: Update, context: CallbackContext) -> int:
     await update.message.reply_photo(
         photo="https://ibb.co/JRbbTWsQ",
@@ -70,7 +70,7 @@ async def ready(update: Update, context: CallbackContext) -> int:
         await update.message.reply_text("Пожалуйста, ответь 'да' или 'нет'.", reply_markup=get_buttons())
         return READY
 
-# Шаги анкеты — запись ответов пользователя
+# Этапы анкеты
 async def nickname(update: Update, context: CallbackContext) -> int:
     context.user_data["nickname"] = update.message.text
     await update.message.reply_text("Теперь укажи свой игровой айди.", reply_markup=get_buttons())
@@ -119,13 +119,12 @@ async def matches_previous(update: Update, context: CallbackContext) -> int:
     await update.message.reply_text("Теперь отправь скриншот за прошлый сезон.", reply_markup=get_buttons())
     return SCREENSHOT_2
 
-# Финальный шаг — сбор всех данных и отправка в 3 чата
+# Финальный шаг — отправка анкеты и задержка
 async def screenshot_2(update: Update, context: CallbackContext) -> int:
     if update.message.photo:
         context.user_data["screenshot_2"] = update.message.photo[-1].file_id
         u = update.message.from_user
 
-        # Сообщение с данными анкеты
         msg = (
             f"Заявка на вступление в клан DEKTRIAN FAMILY:\n"
             f"Игровой ник: {context.user_data['nickname']}\n"
@@ -141,17 +140,14 @@ async def screenshot_2(update: Update, context: CallbackContext) -> int:
         )
 
         try:
-            # Отправка текста и фото администратору
             await context.bot.send_message(ADMIN_ID, msg)
             await context.bot.send_photo(ADMIN_ID, context.user_data['screenshot_1'])
             await context.bot.send_photo(ADMIN_ID, context.user_data['screenshot_2'])
 
-            # Отправка текста и фото в основную группу
             await context.bot.send_message(GROUP_ID, msg)
             await context.bot.send_photo(GROUP_ID, context.user_data['screenshot_1'])
             await context.bot.send_photo(GROUP_ID, context.user_data['screenshot_2'])
 
-            # Отправка текста и фото в дополнительную группу
             await context.bot.send_message(EXTRA_GROUP_ID, msg)
             await context.bot.send_photo(EXTRA_GROUP_ID, context.user_data['screenshot_1'])
             await context.bot.send_photo(EXTRA_GROUP_ID, context.user_data['screenshot_2'])
@@ -160,12 +156,14 @@ async def screenshot_2(update: Update, context: CallbackContext) -> int:
             await update.message.reply_text(f"Ошибка при отправке: {e}")
 
         await update.message.reply_text("✅ Ваша заявка отправлена. Ожидайте ответ!", reply_markup=get_buttons())
-        return ConversationHandler.END
+        await asyncio.sleep(3)
+        await update.message.reply_text("Хотите подать еще одну заявку? Напишите 'да' или 'нет'.", reply_markup=get_buttons())
+        return READY
 
     await update.message.reply_text("Пожалуйста, отправьте скриншот.")
     return SCREENSHOT_2
 
-# Сброс данных анкеты
+# Сброс анкеты
 async def reset(update: Update, context: CallbackContext) -> int:
     query = update.callback_query
     await query.answer()
@@ -173,7 +171,7 @@ async def reset(update: Update, context: CallbackContext) -> int:
     await query.message.edit_text("Все введенные данные были сброшены! Напиши да если готов начать заново.", reply_markup=get_buttons())                 
     return READY
 
-# Обработка всех кнопок
+# Обработка кнопок
 async def button_callback(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
@@ -219,7 +217,7 @@ async def button_callback(update: Update, context: CallbackContext):
             [InlineKeyboardButton("⬅ Назад", callback_data='back_button')]
         ]))
 
-# Основной запуск бота
+# Запуск бота
 def main():
     application = Application.builder().token(TOKEN).build()
 
