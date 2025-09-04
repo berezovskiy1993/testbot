@@ -1,253 +1,399 @@
 import os
+import time
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, CallbackContext, CallbackQueryHandler
+from datetime import datetime, timedelta, timezone
+import requests
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.error import Conflict, TimedOut, NetworkError, BadRequest
 
-# Загружаем переменные окружения (только через Render)
-TOKEN = os.environ.get("API_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID"))
-GROUP_ID = -1002640250280  # основная группа для заявок
-EXTRA_GROUP_ID = -1002011191845  # дополнительная группа, куда тоже отправляется заявка
+BOT_NAME = "dektrian_online_bot"
 
-# Этапы анкеты
-READY, NICKNAME, PLAYER_ID, AGE, GENDER, KD_CURRENT, MATCHES_CURRENT, SCREENSHOT_1, KD_PREVIOUS, MATCHES_PREVIOUS, SCREENSHOT_2 = range(11)
+# -------- ENV --------
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# Список админов
-ADMINS = [
-    "@DektrianTV - Лидер всех кланов",
-    "@Ffllooffy - Зам Основы и Лидер Еспортс",
-    "@RinaSergeevna - Зам Основы",
-    "@FRUKTIK58 - Зам Основы",
-    "@HEADTRICK2 - Зам Еспортс",
-    "@neverforgotme - Лидер Академки",
-    "@Vasvyu6 - Зам Академки",
-    "@kinderskayad - Зам Академки"
-]
+# дефолтные каналы по задаче
+# DEFAULT_CHANNELS = ["@dektrian_family", "@dektrian_tv"]
 
-# Кнопки "Меню" и "Сначала"
-def get_buttons():
+_raw_chats = (os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHANNEL_ID") or "").strip()
+_env_chats = [c.strip() for c in _raw_chats.split(",") if c and c.strip()]
+
+# uniq + сохранение порядка: сначала дефолтные, потом из ENV
+_seen = set()
+CHAT_IDS = []
+for ch in DEFAULT_CHANNELS + _env_chats:
+    if ch and ch not in _seen:
+        CHAT_IDS.append(ch)
+        _seen.add(ch)
+
+# Киев: летом UTC+3, зимой UTC+2. Управляем вручную.
+TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "3"))
+
+# YouTube (используются по триггеру старта на Twitch)
+YT_API_KEY = os.getenv("YT_API_KEY", "").strip()
+YT_CHANNEL_ID = os.getenv("YT_CHANNEL_ID", "").strip()
+
+# Twitch
+TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "").strip()
+TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "").strip()
+TWITCH_USERNAME = os.getenv("TWITCH_USERNAME", "dektrian_tv").strip()
+
+# Статичная картинка для постов (по умолчанию — твоя ссылка/страница).
+# Важно: для стабильного send_photo лучше указывать прямой URL на изображение или file_id.
+STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
+
+# -------- In-memory state --------
+last_twitch_stream_id: str | None = None
+
+_tw_token: str | None = None
+_tw_token_expire_at: int = 0  # unix ts
+
+# когда последний раз дергали Twitch
+_last_called_ts = {"tw": 0}
+
+
+# ==================== УТИЛИТЫ ====================
+def now_local() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=TZ_OFFSET_HOURS)
+
+def _sec_since(ts: int) -> int:
+    return int(time.time()) - ts
+
+
+# ==================== TELEGRAM ====================
+def build_keyboard(youtube_video_id: str | None) -> InlineKeyboardMarkup:
+    """
+    Если знаем id активного YouTube-стрима — кнопка ведёт на его watch-URL.
+    Иначе — на канал.
+    """
+    yt_url = (
+        f"https://www.youtube.com/watch?v={youtube_video_id}"
+        if youtube_video_id else
+        (f"https://www.youtube.com/channel/{YT_CHANNEL_ID}" if YT_CHANNEL_ID else "https://www.youtube.com/@dektrian_tv")
+    )
+    tw_url = f"https://www.twitch.tv/{TWITCH_USERNAME}"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Меню", callback_data='menu'),
-         InlineKeyboardButton("Сначала", callback_data='reset_button')]
+        [InlineKeyboardButton("❤️ Гоу на YouTube", url=yt_url),
+         InlineKeyboardButton("💜 Гоу на Twitch",  url=tw_url)],
+        [InlineKeyboardButton("💸 Гоу Донатик", url="https://new.donatepay.ru/@Dektrian_TV"),
+         InlineKeyboardButton("🤙 Гоу в клан", url="https://t.me/D13_join_bot")]
     ])
 
-def get_menu_buttons():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Критерии", callback_data='criteria_button')],
-        [InlineKeyboardButton("Админы", callback_data='admins_button')],
-        [InlineKeyboardButton("Соцсети", callback_data='socials_button')],
-        [InlineKeyboardButton("⬅ Назад", callback_data='back_button')]
-    ])
-
-# Команда /start
-async def start(update: Update, context: CallbackContext) -> int:
-    await update.message.reply_photo(
-        photo="https://ibb.co/JRbbTWsQ",
-        caption=" "
-    )
-    await update.message.reply_text(
-        "👋 Привет!\n\n"
-        "Ты попал в бот клана DEKTRIAN FAMILY!\n"
-        "Здесь ты можешь подать заявку в один из кланов:\n\n"
-        "▫️ FAMILY — основной клан\n"
-        "▫️ ESPORTS — клан для турнирных составов\n"
-        "▫️ ACADEMY — клан свободного стиля\n\n"
-        "Напиши текстом 'да' и проходи анкету 📝\n\n",
-        reply_markup=get_buttons()
-    )
-    return READY
-
-# Ответ на "да" или "нет"
-async def ready(update: Update, context: CallbackContext) -> int:
-    text = update.message.text.lower()
-    if text == "да":
-        await update.message.reply_text("Отлично! Напиши свой игровой никнейм.", reply_markup=get_buttons())
-        return NICKNAME
-    elif text == "нет":
-        await update.message.reply_text("Если передумаешь, напиши 'да'.", reply_markup=get_buttons())
-        return READY
-    else:
-        await update.message.reply_text("Пожалуйста, ответь 'да' или 'нет'.", reply_markup=get_buttons())
-        return READY
-
-# Этапы анкеты
-async def nickname(update: Update, context: CallbackContext) -> int:
-    context.user_data["nickname"] = update.message.text
-    await update.message.reply_text("Теперь укажи свой игровой айди.", reply_markup=get_buttons())
-    return PLAYER_ID
-
-async def player_id(update: Update, context: CallbackContext) -> int:
-    context.user_data["player_id"] = update.message.text
-    await update.message.reply_text("Сколько тебе полных лет?", reply_markup=get_buttons())
-    return AGE
-
-async def age(update: Update, context: CallbackContext) -> int:
-    context.user_data["age"] = update.message.text
-    await update.message.reply_text("Ты девочка или парень?", reply_markup=get_buttons())
-    return GENDER
-
-async def gender(update: Update, context: CallbackContext) -> int:
-    context.user_data["gender"] = update.message.text.lower()
-    await update.message.reply_text("Какой у тебя КД за текущий сезон?", reply_markup=get_buttons())
-    return KD_CURRENT
-
-async def kd_current(update: Update, context: CallbackContext) -> int:
-    context.user_data["kd_current"] = update.message.text
-    await update.message.reply_text("Сколько матчей ты сыграл в текущем сезоне?", reply_markup=get_buttons())
-    return MATCHES_CURRENT
-
-async def matches_current(update: Update, context: CallbackContext) -> int:
-    context.user_data["matches_current"] = update.message.text
-    await update.message.reply_text("Отправь скриншот статистики за текущий сезон.", reply_markup=get_buttons())
-    return SCREENSHOT_1
-
-async def screenshot_1(update: Update, context: CallbackContext) -> int:
-    if update.message.photo:
-        context.user_data["screenshot_1"] = update.message.photo[-1].file_id
-        await update.message.reply_text("Теперь укажи КД за прошлый сезон.", reply_markup=get_buttons())
-        return KD_PREVIOUS
-    await update.message.reply_text("Пожалуйста, отправьте скриншот.")
-    return SCREENSHOT_1
-
-async def kd_previous(update: Update, context: CallbackContext) -> int:
-    context.user_data["kd_previous"] = update.message.text
-    await update.message.reply_text("Сколько матчей ты сыграл в прошлом сезоне?", reply_markup=get_buttons())
-    return MATCHES_PREVIOUS
-
-async def matches_previous(update: Update, context: CallbackContext) -> int:
-    context.user_data["matches_previous"] = update.message.text
-    await update.message.reply_text("Теперь отправь скриншот за прошлый сезон.", reply_markup=get_buttons())
-    return SCREENSHOT_2
-
-# Финальный шаг — отправка анкеты и задержка
-async def screenshot_2(update: Update, context: CallbackContext) -> int:
-    if update.message.photo:
-        context.user_data["screenshot_2"] = update.message.photo[-1].file_id
-        u = update.message.from_user
-
-        msg = (
-            f"Заявка на вступление в клан DEKTRIAN FAMILY:\n"
-            f"Игровой ник: {context.user_data['nickname']}\n"
-            f"Игровой айди: {context.user_data['player_id']}\n"
-            f"Возраст: {context.user_data['age']}\n"
-            f"Пол: {context.user_data['gender']}\n"
-            f"КД за текущий сезон: {context.user_data['kd_current']}\n"
-            f"Матчи в текущем сезоне: {context.user_data['matches_current']}\n"
-            f"КД за прошлый сезон: {context.user_data['kd_previous']}\n"
-            f"Матчи в прошлом сезоне: {context.user_data['matches_previous']}\n"
-            f"Telegram Username: @{u.username}\n"
-            f"Telegram UserID: {u.id}\n"
-        )
-
+async def tg_broadcast_photo_first(app: Application, text: str, kb: InlineKeyboardMarkup | None, photo_url: str):
+    """
+    Сначала пробуем отправить как фото (баннер). Если не вышло (непрямой URL и т.п.),
+    фолбэк — обычное сообщение с включённым превью по ссылке.
+    """
+    for chat_id in CHAT_IDS:
+        # 1) Фото
         try:
-            await context.bot.send_message(ADMIN_ID, msg)
-            await context.bot.send_photo(ADMIN_ID, context.user_data['screenshot_1'])
-            await context.bot.send_photo(ADMIN_ID, context.user_data['screenshot_2'])
+            await app.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo_url,
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+            continue
+        except BadRequest as e:
+            print(f"[TG] photo send failed for {chat_id}: {e}. Fallback to link+message.")
+        except Exception as e:
+            print(f"[TG] photo send error to {chat_id}: {e}. Fallback to link+message.")
 
-            await context.bot.send_message(GROUP_ID, msg)
-            await context.bot.send_photo(GROUP_ID, context.user_data['screenshot_1'])
-            await context.bot.send_photo(GROUP_ID, context.user_data['screenshot_2'])
+        # 2) Фолбэк: ссылка + текст (оставляем превью включённым)
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id,
+                text=f"{photo_url}\n\n{text}",
+                parse_mode="HTML",
+                reply_markup=kb,
+                disable_web_page_preview=False
+            )
+        except Exception as e:
+            print(f"[TG] message send error to {chat_id}: {e}")
 
-            await context.bot.send_message(EXTRA_GROUP_ID, msg)
-            await context.bot.send_photo(EXTRA_GROUP_ID, context.user_data['screenshot_1'])
-            await context.bot.send_photo(EXTRA_GROUP_ID, context.user_data['screenshot_2'])
+
+# ==================== YOUTUBE ====================
+def _yt_fetch_live_once() -> dict | None:
+    """
+    ОДНА попытка получить активный live на YouTube:
+      - search.list (eventType=live) -> videoId, snippet.title
+      - videos.list (part=snippet) -> лучшие thumbnails
+    Возвращает dict {'id': videoId, 'title': title, 'thumb': best_thumb_url} или None.
+    Стоимость: ~101 кв. ед. (100 + 1).
+    """
+    if not (YT_API_KEY and YT_CHANNEL_ID):
+        return None
+
+    try:
+        # 1) Ищем live
+        r = requests.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            params={
+                "part": "snippet",
+                "channelId": YT_CHANNEL_ID,
+                "eventType": "live",
+                "type": "video",
+                "maxResults": 1,
+                "order": "date",
+                "key": YT_API_KEY,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if not items:
+            return None
+
+        video_id = items[0]["id"]["videoId"]
+        yt_title = items[0]["snippet"].get("title") or "LIVE on YouTube"
+
+        # 2) Берём лучшие thumbnail из videos.list (snippet)
+        r2 = requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "part": "snippet",
+                "id": video_id,
+                "key": YT_API_KEY,
+                "maxResults": 1,
+            },
+            timeout=20,
+        )
+        r2.raise_for_status()
+        vitems = r2.json().get("items", [])
+        thumb_url = None
+        if vitems:
+            thumbs = (vitems[0].get("snippet") or {}).get("thumbnails") or {}
+            # приоритет: maxres > standard > high > medium > default
+            for k in ("maxres", "standard", "high", "medium", "default"):
+                if k in thumbs and thumbs[k].get("url"):
+                    thumb_url = thumbs[k]["url"]
+                    break
+
+        return {"id": video_id, "title": yt_title, "thumb": thumb_url}
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", "?")
+        try:
+            body = e.response.json()
+        except Exception:
+            body = getattr(e.response, "text", "")
+        print(f"[YT] HTTP {code}: {body}")
+    except Exception as e:
+        print(f"[YT] error: {e}")
+    return None
+
+async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int = 10) -> dict | None:
+    """
+    До max_attempts попыток с паузой delay_seconds.
+    Возвращает dict {'id','title','thumb'} или None.
+    """
+    for attempt in range(1, max_attempts + 1):
+        res = _yt_fetch_live_once()
+        if res:
+            return res
+        if attempt < max_attempts:
+            await asyncio.sleep(delay_seconds)
+    return None
+
+
+# ==================== TWITCH ====================
+def _tw_fetch_token() -> str | None:
+    """Получаем/обновляем app access token; держим expiry локально."""
+    global _tw_token, _tw_token_expire_at
+    now_ts = int(time.time())
+    if _tw_token and now_ts < _tw_token_expire_at - 60:
+        return _tw_token
+    try:
+        r = requests.post(
+            "https://id.twitch.tv/oauth2/token",
+            data={
+                "client_id": TWITCH_CLIENT_ID,
+                "client_secret": TWITCH_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        _tw_token = data["access_token"]
+        _tw_token_expire_at = now_ts + int(data.get("expires_in", 3600))
+        return _tw_token
+    except requests.HTTPError as e:
+        print(f"[TW] token HTTP {getattr(e.response, 'status_code', '?')}: {getattr(e.response, 'text', '')}")
+        _tw_token = None
+        _tw_token_expire_at = 0
+    except Exception as e:
+        print(f"[TW] token error: {e}")
+        _tw_token = None
+        _tw_token_expire_at = 0
+    return None
+
+def twitch_check_live() -> dict | None:
+    """
+    Возвращает {'id': stream_id, 'title': title} если обнаружен НОВЫЙ эфир, иначе None.
+    """
+    global last_twitch_stream_id
+    if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and TWITCH_USERNAME):
+        return None
+
+    tk = _tw_fetch_token()
+    if not tk:
+        return None
+
+    def _call() -> dict | None:
+        r = requests.get(
+            "https://api.twitch.tv/helix/streams",
+            params={"user_login": TWITCH_USERNAME},
+            headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {tk}"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if not data:
+            return None
+        s = data[0]
+        sid = s.get("id")
+        title = s.get("title")
+        # Если новый stream_id — считаем это свежим стартом
+        if sid and sid != last_twitch_stream_id:
+            return {"id": sid, "title": title}
+        return None
+
+    try:
+        res = _call()
+        if res:
+            last_twitch_stream_id = res["id"]
+        return res
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            print(f"[TW] streams HTTP {e.response.status_code}: retry with fresh token")
+            # сброс токена и одна повторная попытка
+            global _tw_token, _tw_token_expire_at
+            _tw_token = None
+            _tw_token_expire_at = 0
+            tk2 = _tw_fetch_token()
+            if tk2:
+                try:
+                    res = _call()
+                    if res:
+                        last_twitch_stream_id = res["id"]
+                    return res
+                except Exception as e2:
+                    print(f"[TW] retry failed: {e2}")
+                    return None
+        code = getattr(e.response, "status_code", "?")
+        body = getattr(e.response, "text", "")
+        print(f"[TW] streams HTTP {code}: {body}")
+    except Exception as e:
+        print(f"[TW] error: {e}")
+    return None
+
+
+# ==================== ОСНОВНАЯ ЛОГИКА ====================
+async def _announce_with_sources(app: Application, title: str, yt_video: dict | None):
+    """
+    Собираем пост:
+      - фото: превью YouTube (если есть) иначе STATIC_IMAGE_URL
+      - кнопки: YouTube → на стрим, если знаем id; иначе на канал
+    """
+    yt_id = yt_video["id"] if yt_video else None
+    photo_url = (yt_video.get("thumb") if (yt_video and yt_video.get("thumb")) else STATIC_IMAGE_URL)
+
+    text = (
+        f"🔴 <b>Стрим начался! Забегай, я тебя жду :)</b>\n\n"
+        f"<b>{title or ''}</b>\n\n"
+        f"#DEKTRIAN #D13 #ОНЛАЙН"
+    )
+    kb = build_keyboard(yt_id)
+    await tg_broadcast_photo_first(app, text, kb, photo_url)
+
+async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int = 10) -> dict | None:
+    """
+    До max_attempts попыток с паузой delay_seconds.
+    Возвращает dict {'id','title','thumb'} или None.
+    """
+    for attempt in range(1, max_attempts + 1):
+        res = _yt_fetch_live_once()
+        if res:
+            return res
+        if attempt < max_attempts:
+            await asyncio.sleep(delay_seconds)
+    return None
+
+async def scheduler(app: Application):
+    """
+    Раз в минуту опрашиваем Twitch.
+    При детекте старта — 3 попытки (через 10 сек) подтянуть YouTube (линк + превью), затем пост.
+    Дубликаты не шлём: проверка по stream_id.
+    """
+    print(f"[SCHED] started at {now_local().isoformat()}")
+    while True:
+        try:
+            # --- Twitch раз в минуту ---
+            if _sec_since(_last_called_ts["tw"]) >= 60:
+                print(f"[SCHED] TW tick (interval=60s)")
+                tw = twitch_check_live()
+                if tw:
+                    yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
+                    title = tw.get("title") or (yt_live.get("title") if yt_live else "Стрим")
+                    await _announce_with_sources(app, title, yt_live)
+                _last_called_ts["tw"] = int(time.time())
+
+            await asyncio.sleep(5)  # короткий сон — не жрём CPU
 
         except Exception as e:
-            await update.message.reply_text(f"Ошибка при отправке: {e}")
+            print(f"[SCHED] loop error: {e}")
+            await asyncio.sleep(10)
 
-        await update.message.reply_text("✅ Ваша заявка отправлена. Ожидайте ответ!", reply_markup=get_buttons())
-        await asyncio.sleep(3)
-        await update.message.reply_text("Хотите подать еще одну заявку? Напишите 'да' или 'нет'.", reply_markup=get_buttons())
-        return READY
 
-    await update.message.reply_text("Пожалуйста, отправьте скриншот.")
-    return SCREENSHOT_2
+# ==================== КОМАНДЫ ====================
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Тестовый пост с той же логикой превью:
+      - пробуем 3× получить YouTube live и превью
+      - если не нашли — берём статичную картинку
+    """
+    yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
+    title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
+    await _announce_with_sources(context.application, title, yt_live)
+    try:
+        await update.effective_message.reply_text("Тест: отправил анонс в целевые чаты/каналы.")
+    except Exception:
+        pass
 
-# Сброс анкеты
-async def reset(update: Update, context: CallbackContext) -> int:
-    query = update.callback_query
-    await query.answer()
-    context.user_data.clear()
-    await query.message.edit_text("Все введенные данные были сброшены! Напиши да если готов начать заново.", reply_markup=get_buttons())                 
-    return READY
 
-# Обработка кнопок
-async def button_callback(update: Update, context: CallbackContext):
-    query = update.callback_query
-    await query.answer()
+# ==================== ERROR-HANDLER (для чистых логов на polling) ====================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, Conflict):
+        print("[POLLING] Conflict: другой процесс держит getUpdates. Жду и пробую снова...")
+        await asyncio.sleep(5)
+        return
+    if isinstance(err, (TimedOut, NetworkError)):
+        print(f"[POLLING] transient error: {err}")
+        return
+    print(f"[POLLING] unhandled error: {err}")
 
-    if query.data == 'reset_button':
-        return await reset(update, context)
-    elif query.data == 'menu':
-        await query.message.edit_reply_markup(reply_markup=get_menu_buttons())
-    elif query.data == 'back_button':
-        await query.message.edit_reply_markup(reply_markup=get_buttons())
-    elif query.data == 'criteria_button':
-        await query.message.edit_text(
-            "Критерии клана DEKTRIAN FAMILY:\n"
-            "1. Смена тега в течении 7 дней.\n"
-            "2. Кд на 100 матчей (Девушки - 4; Мужчины - 5)\n"
-            "3. Возраст 16+.\n"
-            "4. Актив в телеграмм чате.\n"
-            "5. Участие на стримах Лидера и клановых мероприятиях.\n\n"
-            "_________________________________\n"
-            "Критерии клана DEKTRIAN ACADEMY:\n"
-            "1. Смена тега в течении 7 дней.\n"
-            "2. Кд и матчи не важны.\n"
-            "3. Возраст 14+.\n"
-            "4. Актив в телеграмм чате.\n"
-            "5. Участие на стримах Лидера и клановых мероприятиях.\n\n"
-            "_________________________________\n"
-            "Критерии клана DEKTRIAN ESPORTS:\n"
-            "1. Смена тега в течении 7 дней.\n"
-            "2. Возраст 16+\n"
-            "3. Наличие результатов и хайлайтов\n"
-            "4. Преимущество отдается собранным пакам\n",
-            reply_markup=get_menu_buttons()
-        )
-    elif query.data == 'admins_button':
-        await query.message.edit_text("Список админов:\n" + "\n".join(ADMINS), reply_markup=get_menu_buttons())
-    elif query.data == 'socials_button':
-        await query.message.edit_text("Выберите платформу:", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("YouTube", url="https://www.youtube.com/@Dektrian_TV")],
-            [InlineKeyboardButton("Twitch", url="https://www.twitch.tv/dektrian_tv")],
-            [InlineKeyboardButton("Группа Telegram", url="https://t.me/dektrian_tv")],
-            [InlineKeyboardButton("Канал Telegram", url="https://t.me/dektrian_family")],
-            [InlineKeyboardButton("TikTok", url="https://www.tiktok.com/@dektrian_tv")],
-            [InlineKeyboardButton("⬅ Назад", callback_data='back_button')]
-        ]))
 
-# Запуск бота
+# ==================== STARTUP ====================
+async def _on_start(app: Application):
+    asyncio.create_task(scheduler(app))
+    print(f"[STARTED] {BOT_NAME} at {now_local().isoformat()}")
+
+
 def main():
-    application = Application.builder().token(TOKEN).build()
+    if not TG_TOKEN or not CHAT_IDS:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS/TELEGRAM_CHANNEL_ID in Environment")
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            READY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ready), CallbackQueryHandler(button_callback)],
-            NICKNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, nickname), CallbackQueryHandler(button_callback)],
-            PLAYER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, player_id), CallbackQueryHandler(button_callback)],
-            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, age), CallbackQueryHandler(button_callback)],
-            GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, gender), CallbackQueryHandler(button_callback)],
-            KD_CURRENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, kd_current), CallbackQueryHandler(button_callback)],
-            MATCHES_CURRENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, matches_current), CallbackQueryHandler(button_callback)],
-            SCREENSHOT_1: [MessageHandler(filters.PHOTO, screenshot_1), CallbackQueryHandler(button_callback)],
-            KD_PREVIOUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, kd_previous), CallbackQueryHandler(button_callback)],
-            MATCHES_PREVIOUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, matches_previous), CallbackQueryHandler(button_callback)],
-            SCREENSHOT_2: [MessageHandler(filters.PHOTO, screenshot_2), CallbackQueryHandler(button_callback)],
-        },
-        fallbacks=[]
-    )
+    application = Application.builder().token(TG_TOKEN).post_init(_on_start).build()
 
-    application.add_handler(conv_handler)
-    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(CommandHandler("test", cmd_test))
+    application.add_error_handler(on_error)
 
-    port = int(os.environ.get("PORT", 10000))
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=TOKEN,
-        webhook_url=f"https://testbot-bovn.onrender.com/{TOKEN}",
+    application.run_polling(
+        close_loop=False,
+        drop_pending_updates=True,
+        allowed_updates=None
     )
 
 if __name__ == "__main__":
