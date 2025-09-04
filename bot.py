@@ -2,21 +2,23 @@ import os
 import time
 import asyncio
 from datetime import datetime, timedelta, timezone
+
 import requests
+import aiohttp  # нужен для self-ping
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import Conflict, TimedOut, NetworkError, BadRequest
 
 BOT_NAME = "dektrian_online_bot"
 
-# -------- ENV --------
+# ========= ENV =========
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-# ВНИМАНИЕ: теперь постим ТОЛЬКО в указанные тут каналы/чаты (закрытый канал идёт как -100xxxxxxxxxx)
+# Постим ТОЛЬКО туда, что указано в переменной окружения (закрытые каналы/чаты ID формата -100...)
 _raw_chats = (os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHANNEL_ID") or "").strip()
 CHAT_IDS = [c.strip() for c in _raw_chats.split(",") if c.strip()]
 
-# Киев: летом UTC+3, зимой UTC+2. Управляем вручную.
+# Киев: летом UTC+3, зимой UTC+2 — вручную
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "3"))
 
 # YouTube (используются по триггеру старта на Twitch)
@@ -28,16 +30,16 @@ TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "").strip()
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "").strip()
 TWITCH_USERNAME = os.getenv("TWITCH_USERNAME", "dektrian_tv").strip()
 
-# Картинка для постов (прямой URL лучше; иначе сработает фолбэк на ссылку)
+# Картинка для постов (желательно прямой URL на изображение)
 STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
 
 # Параметры вебхука
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")  # например, https://your-app.onrender.com
-PORT = int(os.getenv("PORT", "8080"))
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "dektrian-secret")  # произвольная строка
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/telegram/{BOT_NAME}")  # путь на котором висит вебхук
+PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
+PORT = int(os.getenv("PORT", os.getenv("RENDER_PORT", "8080")))
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "dektrian-secret")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/telegram/{BOT_NAME}")
 
-# -------- In-memory state --------
+# ========= In-memory state =========
 last_twitch_stream_id: str | None = None
 _tw_token: str | None = None
 _tw_token_expire_at: int = 0  # unix ts
@@ -71,7 +73,8 @@ def build_keyboard(youtube_video_id: str | None) -> InlineKeyboardMarkup:
 
 async def tg_broadcast_photo_first(app: Application, text: str, kb: InlineKeyboardMarkup | None, photo_url: str):
     """
-    Сначала как фото; если не выйдет — ссылка + текст с превью.
+    Сначала пробуем отправить как фото (баннер). Если не вышло (непрямой URL и т.п.),
+    фолбэк — обычное сообщение с включённым превью по ссылке.
     """
     for chat_id in CHAT_IDS:
         # 1) Фото
@@ -103,9 +106,15 @@ async def tg_broadcast_photo_first(app: Application, text: str, kb: InlineKeyboa
 
 # ==================== YOUTUBE ====================
 def _yt_fetch_live_once() -> dict | None:
+    """
+    ОДНА попытка получить активный live на YouTube.
+    Возвращает dict {'id': videoId, 'title': title, 'thumb': best_thumb_url} или None.
+    """
     if not (YT_API_KEY and YT_CHANNEL_ID):
         return None
+
     try:
+        # 1) Ищем live
         r = requests.get(
             "https://www.googleapis.com/youtube/v3/search",
             params={
@@ -123,9 +132,11 @@ def _yt_fetch_live_once() -> dict | None:
         items = r.json().get("items", [])
         if not items:
             return None
+
         video_id = items[0]["id"]["videoId"]
         yt_title = items[0]["snippet"].get("title") or "LIVE on YouTube"
 
+        # 2) Берём лучшие thumbnail из videos.list (snippet)
         r2 = requests.get(
             "https://www.googleapis.com/youtube/v3/videos",
             params={
@@ -141,10 +152,12 @@ def _yt_fetch_live_once() -> dict | None:
         thumb_url = None
         if vitems:
             thumbs = (vitems[0].get("snippet") or {}).get("thumbnails") or {}
+            # приоритет: maxres > standard > high > medium > default
             for k in ("maxres", "standard", "high", "medium", "default"):
                 if k in thumbs and thumbs[k].get("url"):
                     thumb_url = thumbs[k]["url"]
                     break
+
         return {"id": video_id, "title": yt_title, "thumb": thumb_url}
     except requests.HTTPError as e:
         code = getattr(e.response, "status_code", "?")
@@ -158,6 +171,10 @@ def _yt_fetch_live_once() -> dict | None:
     return None
 
 async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int = 10) -> dict | None:
+    """
+    До max_attempts попыток с паузой delay_seconds.
+    Возвращает dict {'id','title','thumb'} или None.
+    """
     for attempt in range(1, max_attempts + 1):
         res = _yt_fetch_live_once()
         if res:
@@ -168,6 +185,7 @@ async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int =
 
 # ==================== TWITCH ====================
 def _tw_fetch_token() -> str | None:
+    """Получаем/обновляем app access token; держим expiry локально."""
     global _tw_token, _tw_token_expire_at
     now_ts = int(time.time())
     if _tw_token and now_ts < _tw_token_expire_at - 60:
@@ -223,6 +241,7 @@ def twitch_check_live() -> dict | None:
         s = data[0]
         sid = s.get("id")
         title = s.get("title")
+        # Если новый stream_id — считаем это свежим стартом
         if sid and sid != last_twitch_stream_id:
             return {"id": sid, "title": title}
         return None
@@ -235,6 +254,7 @@ def twitch_check_live() -> dict | None:
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
             print(f"[TW] streams HTTP {e.response.status_code}: retry with fresh token")
+            # сброс токена и одна повторная попытка
             global _tw_token, _tw_token_expire_at
             _tw_token = None
             _tw_token_expire_at = 0
@@ -257,12 +277,18 @@ def twitch_check_live() -> dict | None:
 
 # ==================== ОСНОВНАЯ ЛОГИКА ====================
 async def _announce_with_sources(app: Application, title: str, yt_video: dict | None):
+    """
+    Собираем пост:
+      - фото: превью YouTube (если есть) иначе STATIC_IMAGE_URL
+      - кнопки: YouTube → на стрим, если знаем id; иначе на канал
+    """
     yt_id = yt_video["id"] if yt_video else None
     photo_url = (yt_video.get("thumb") if (yt_video and yt_video.get("thumb")) else STATIC_IMAGE_URL)
+
     text = (
-        f"🔴 <b>Стрим начался! Забегай, я тебя жду :)</b>\n\n"
+        "🔴 <b>Стрим начался! Забегай, я тебя жду :)</b>\n\n"
         f"<b>{title or ''}</b>\n\n"
-        f"#DEKTRIAN #D13 #ОНЛАЙН"
+        "#DEKTRIAN #D13 #ОНЛАЙН"
     )
     kb = build_keyboard(yt_id)
     await tg_broadcast_photo_first(app, text, kb, photo_url)
@@ -276,7 +302,7 @@ async def minute_loop(app: Application):
     while True:
         try:
             if _sec_since(_last_called_ts["tw"]) >= 60:
-                print(f"[WAKE] tick: twitch check")
+                print("[WAKE] tick: twitch check")
                 tw = twitch_check_live()
                 if tw:
                     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
@@ -287,8 +313,32 @@ async def minute_loop(app: Application):
             print(f"[WAKE] loop error: {e}")
         await asyncio.sleep(5)  # короткий сон, чтобы не жрать CPU
 
+async def self_ping():
+    """
+    Периодический self-ping, чтобы Render (или другой бесплатный хост) не усыплял сервис.
+    Раз в 10 минут дергаем PUBLIC_URL/_wake. 404 тоже засчитывается как трафик.
+    """
+    if not PUBLIC_URL:
+        print("[SELF-PING] skipped: PUBLIC_URL is empty")
+        return
+    print(f"[SELF-PING] started; target={PUBLIC_URL}/_wake")
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{PUBLIC_URL}/_wake", timeout=10) as resp:
+                    _ = await resp.text()
+                    print(f"[SELF-PING] status={resp.status}")
+        except Exception as e:
+            print(f"[SELF-PING] error: {e}")
+        await asyncio.sleep(600)  # каждые 10 минут
+
 # ==================== КОМАНДЫ ====================
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Тестовый пост с логикой превью:
+      - пробуем 3× получить YouTube live и превью
+      - если не нашли — берём статичную картинку
+    """
     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
     title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
     await _announce_with_sources(context.application, title, yt_live)
@@ -310,8 +360,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== STARTUP ====================
 async def _on_start(app: Application):
-    # Запускаем минутный «будильник» в фоне
+    # Запускаем фоновые задачи
     asyncio.create_task(minute_loop(app))
+    asyncio.create_task(self_ping())
     print(f"[STARTED] {BOT_NAME} at {now_local().isoformat()}")
 
 def main():
@@ -319,7 +370,7 @@ def main():
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS in Environment")
 
     if not PUBLIC_URL:
-        raise SystemExit("Set PUBLIC_URL (https://<your-host>) for webhook")
+        raise SystemExit("Set PUBLIC_URL (https://<your-host>) for webhook (или используйте RENDER_EXTERNAL_URL)")
 
     application = (
         Application.builder()
@@ -341,7 +392,7 @@ def main():
         port=PORT,
         url_path=WEBHOOK_PATH,         # локальный путь, по которому будет принимать апдейты
         webhook_url=webhook_url,       # публичный URL для Telegram setWebhook
-        secret_token=WEBHOOK_SECRET,   # секрет для X-Telegram-Bot-Api-Secret-Token
+        secret_token=WEBHOOK_SECRET,   # X-Telegram-Bot-Api-Secret-Token
         drop_pending_updates=True,
         allowed_updates=None,
     )
