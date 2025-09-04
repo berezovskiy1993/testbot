@@ -222,14 +222,14 @@ def _format_table_for_range(tasks: list[dict], start: date, end: date, title: st
     header = f"{title}\n"
     lines.append(html_escape(header))
     lines.append("<pre>")
-    lines.append("Дата     Дн  Время  Событие")
-    lines.append("------- ---- ------ ------------")
+    lines.append("Дата  Дн  Время Событие")
+    lines.append("---- ---- ----- -----------")
     for d in _daterange_days(start, end):
         day = d.strftime("%d.%m")
         wd = _weekday_abr(d)
         day_tasks = m.get(d, [])
         if not day_tasks:
-            lines.append(f"{day:8} {wd:3} {'--':5}  нет стримов")
+            lines.append(f"{day:3} {wd:3} {'--':3}  нет стримов")
             continue
         day_tasks_sorted = sorted(
             day_tasks,
@@ -240,10 +240,10 @@ def _format_table_for_range(tasks: list[dict], start: date, end: date, title: st
             hhmm, cleaned_title = _extract_time_from_title(t.get("title") or "")
             time_str = hhmm or "--"
             if first:
-                lines.append(f"{day:8} {wd:3} {time_str:5}  {html_escape(cleaned_title)}")
+                lines.append(f"{day:3} {wd:3} {time_str:3}  {html_escape(cleaned_title)}")
                 first = False
             else:
-                lines.append(f"{'':8} {'':3} {time_str:5}  {html_escape(cleaned_title)}")
+                lines.append(f"{'':3} {'':3} {time_str:3}  {html_escape(cleaned_title)}")
     lines.append("</pre>")
     return "\n".join(lines)
 
