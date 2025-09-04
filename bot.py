@@ -223,7 +223,7 @@ def _format_table_for_range(tasks: list[dict], start: date, end: date, title: st
     lines.append(html_escape(header))
     lines.append("<pre>")
     lines.append("Дата     Дн  Время  Событие")
-    lines.append("------- ---- ------ ---------------")
+    lines.append("------- ---- ------ ------------")
     for d in _daterange_days(start, end):
         day = d.strftime("%d.%m")
         wd = _weekday_abr(d)
