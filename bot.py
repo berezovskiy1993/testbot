@@ -2,12 +2,19 @@ import os
 import time
 import asyncio
 import re
-from datetime import datetime, timedelta, timezone, date  # ← добавлен date
+from datetime import datetime, timedelta, timezone, date  # важно: date импортирован
 
 import requests
 import aiohttp  # нужен для self-ping
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    BotCommand,
+)
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import Conflict, TimedOut, NetworkError, BadRequest
 
 BOT_NAME = "dektrian_online_bot"
@@ -22,7 +29,7 @@ CHAT_IDS = [c.strip() for c in _raw_chats.split(",") if c.strip()]
 # Киев: летом UTC+3, зимой UTC+2 — вручную
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "3"))
 
-# === Google Tasks (для команд /today /week /next) ===
+# === Google Tasks (для команд) ===
 GOOGLE_TASKS_CLIENT_ID = os.getenv("GOOGLE_TASKS_CLIENT_ID", "").strip()
 GOOGLE_TASKS_CLIENT_SECRET = os.getenv("GOOGLE_TASKS_CLIENT_SECRET", "").strip()
 GOOGLE_TASKS_REFRESH_TOKEN = os.getenv("GOOGLE_TASKS_REFRESH_TOKEN", "").strip()
@@ -59,12 +66,8 @@ def now_local() -> datetime:
 def _sec_since(ts: int) -> int:
     return int(time.time()) - ts
 
-# ==================== TELEGRAM ====================
+# ==================== TELEGRAM UI ====================
 def build_keyboard(youtube_video_id: str | None) -> InlineKeyboardMarkup:
-    """
-    Если знаем id активного YouTube-стрима — кнопка ведёт на его watch-URL.
-    Иначе — на канал.
-    """
     yt_url = (
         f"https://www.youtube.com/watch?v={youtube_video_id}"
         if youtube_video_id else
@@ -78,44 +81,31 @@ def build_keyboard(youtube_video_id: str | None) -> InlineKeyboardMarkup:
          InlineKeyboardButton("🤙 Гоу в клан", url="https://t.me/D13_join_bot")]
     ])
 
+def main_reply_kb() -> ReplyKeyboardMarkup:
+    # Постоянная клавиатура с русскими кнопками (без слеша)
+    rows = [
+        [KeyboardButton("📅 Сегодня"), KeyboardButton("🗓 Неделя")],
+        [KeyboardButton("⏭ Ближайший")],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
+
 async def tg_broadcast_photo_first(app: Application, text: str, kb: InlineKeyboardMarkup | None, photo_url: str):
-    """
-    Сначала пробуем отправить как фото (баннер). Если не вышло (непрямой URL и т.п.),
-    фолбэк — обычное сообщение с включённым превью по ссылке.
-    """
     for chat_id in CHAT_IDS:
-        # 1) Фото
         try:
-            await app.bot.send_photo(
-                chat_id=chat_id,
-                photo=photo_url,
-                caption=text,
-                parse_mode="HTML",
-                reply_markup=kb
-            )
+            await app.bot.send_photo(chat_id=chat_id, photo=photo_url, caption=text, parse_mode="HTML", reply_markup=kb)
             continue
         except BadRequest as e:
             print(f"[TG] photo send failed for {chat_id}: {e}. Fallback to link+message.")
         except Exception as e:
             print(f"[TG] photo send error to {chat_id}: {e}. Fallback to link+message.")
-
-        # 2) Фолбэк: ссылка + текст (оставляем превью включённым)
         try:
-            await app.bot.send_message(
-                chat_id=chat_id,
-                text=f"{photo_url}\n\n{text}",
-                parse_mode="HTML",
-                reply_markup=kb,
-                disable_web_page_preview=False
-            )
+            await app.bot.send_message(chat_id=chat_id, text=f"{photo_url}\n\n{text}", parse_mode="HTML",
+                                       reply_markup=kb, disable_web_page_preview=False)
         except Exception as e:
             print(f"[TG] message send error to {chat_id}: {e}")
 
 # ==================== GOOGLE TASKS (helpers) ====================
 def _tasks_get_access_token() -> str | None:
-    """
-    Берём access_token по refresh_token для Google Tasks API.
-    """
     if not (GOOGLE_TASKS_CLIENT_ID and GOOGLE_TASKS_CLIENT_SECRET and GOOGLE_TASKS_REFRESH_TOKEN and GOOGLE_TASKS_LIST_ID):
         print("[TASKS] Missing env: CLIENT_ID/SECRET/REFRESH_TOKEN/LIST_ID")
         return None
@@ -137,10 +127,6 @@ def _tasks_get_access_token() -> str | None:
         return None
 
 def _tasks_fetch_all() -> list[dict]:
-    """
-    Тянем все невыполненные задачи из указанного списка (страницы склеиваем).
-    Каждая задача = all-day на дату due.
-    """
     token = _tasks_get_access_token()
     if not token:
         return []
@@ -148,11 +134,7 @@ def _tasks_fetch_all() -> list[dict]:
     page_token = None
     try:
         while True:
-            params = {
-                "showCompleted": "false",
-                "showDeleted": "false",
-                "maxResults": "100",
-            }
+            params = {"showCompleted": "false", "showDeleted": "false", "maxResults": "100"}
             if page_token:
                 params["pageToken"] = page_token
             r = requests.get(
@@ -174,28 +156,17 @@ def _tasks_fetch_all() -> list[dict]:
 _time_re = re.compile(r"(^|\s)(\d{1,2}):(\d{2})(\b)")
 
 def _extract_time_from_title(title: str) -> tuple[str | None, str]:
-    """
-    Если в заголовке есть время (например '21:00 Призовые кастомы'), вернём ('21:00', 'Призовые кастомы').
-    Иначе (None, оригинальный заголовок).
-    """
     if not title:
         return None, "Без названия"
     m = _time_re.search(title)
     if not m:
         return None, title.strip()
     hhmm = f"{m.group(2)}:{m.group(3)}"
-    # убираем leading-время + пробелы
     cleaned = title[:m.start()].strip() + " " + title[m.end():].strip()
-    cleaned = cleaned.strip()
-    if not cleaned:
-        cleaned = title.strip()
+    cleaned = cleaned.strip() or title.strip()
     return hhmm, cleaned
 
 def _due_to_local_date(due_iso: str) -> date | None:
-    """
-    Превращает due (например '2025-09-16T00:00:00.000Z') в локальную дату Europe/Kyiv.
-    Для all-day это ок: получится та же дата в местном поясе.
-    """
     if not due_iso:
         return None
     try:
@@ -204,81 +175,48 @@ def _due_to_local_date(due_iso: str) -> date | None:
         return dt_local.date()
     except Exception:
         try:
-            # запасной парсер по первым 10 символам (YYYY-MM-DD)
             return datetime.strptime(due_iso[:10], "%Y-%m-%d").date()
         except Exception:
             return None
 
 def _format_tasks_list(tasks: list[dict], header: str) -> str:
-    """
-    Форматирует список задач стримов в читаемый текст.
-    Показываем дату, при наличии времени в title — отдельным полем.
-    """
     if not tasks:
         return f"{header}\n\nНет стримов в расписании."
-
-    # Сортируем по дате (и времени, если есть в заголовке)
     def sort_key(t: dict):
         d = _due_to_local_date(t.get("due") or "")
         time_in_title, _ = _extract_time_from_title(t.get("title") or "")
-        time_sort = time_in_title or "99:99"  # None -> в конец
+        time_sort = time_in_title or "99:99"
         return (d or datetime(2100, 1, 1).date(), time_sort)
-
     tasks_sorted = sorted(tasks, key=sort_key)
-
     lines = [header, ""]
     for t in tasks_sorted:
         title = t.get("title") or "Без названия"
         d = _due_to_local_date(t.get("due") or "")
         date_str = d.strftime("%d.%m (%a)") if d else "без даты"
         hhmm, cleaned_title = _extract_time_from_title(title)
-        if hhmm:
-            lines.append(f"▫️ {date_str} {hhmm} — {cleaned_title}")
-        else:
-            lines.append(f"▫️ {date_str} — {cleaned_title}")
+        lines.append(f"▫️ {date_str} {hhmm + ' ' if hhmm else ''}— {cleaned_title}")
     return "\n".join(lines)
 
 # ==================== YOUTUBE ====================
 def _yt_fetch_live_once() -> dict | None:
-    """
-    ОДНА попытка получить активный live на YouTube.
-    Возвращает dict {'id': videoId, 'title': title, 'thumb': best_thumb_url} или None.
-    """
     if not (YT_API_KEY and YT_CHANNEL_ID):
         return None
-
     try:
-        # 1) Ищем live
         r = requests.get(
             "https://www.googleapis.com/youtube/v3/search",
-            params={
-                "part": "snippet",
-                "channelId": YT_CHANNEL_ID,
-                "eventType": "live",
-                "type": "video",
-                "maxResults": 1,
-                "order": "date",
-                "key": YT_API_KEY,
-            },
+            params={"part": "snippet", "channelId": YT_CHANNEL_ID, "eventType": "live", "type": "video",
+                    "maxResults": 1, "order": "date", "key": YT_API_KEY},
             timeout=20,
         )
         r.raise_for_status()
         items = r.json().get("items", [])
         if not items:
             return None
-
         video_id = items[0]["id"]["videoId"]
         yt_title = items[0]["snippet"].get("title") or "LIVE on YouTube"
-
-        # 2) Берём лучшие thumbnail из videos.list (snippet)
         r2 = requests.get(
             "https://www.googleapis.com/youtube/v3/videos",
-            params={
-                "part": "snippet",
-                "id": video_id,
-                "key": YT_API_KEY,
-                "maxResults": 1,
-            },
+            params={"part": "snippet", "id": video_id, "key": YT_API_KEY, "maxResults": 1},
             timeout=20,
         )
         r2.raise_for_status()
@@ -290,7 +228,6 @@ def _yt_fetch_live_once() -> dict | None:
                 if k in thumbs and thumbs[k].get("url"):
                     thumb_url = thumbs[k]["url"]
                     break
-
         return {"id": video_id, "title": yt_title, "thumb": thumb_url}
     except requests.HTTPError as e:
         code = getattr(e.response, "status_code", "?")
@@ -304,10 +241,6 @@ def _yt_fetch_live_once() -> dict | None:
     return None
 
 async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int = 10) -> dict | None:
-    """
-    До max_attempts попыток с паузой delay_seconds.
-    Возвращает dict {'id','title','thumb'} или None.
-    """
     for attempt in range(1, max_attempts + 1):
         res = _yt_fetch_live_once()
         if res:
@@ -318,7 +251,6 @@ async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int =
 
 # ==================== TWITCH ====================
 def _tw_fetch_token() -> str | None:
-    """Получаем/обновляем app access token; держим expiry локально."""
     global _tw_token, _tw_token_expire_at
     now_ts = int(time.time())
     if _tw_token and now_ts < _tw_token_expire_at - 60:
@@ -326,11 +258,7 @@ def _tw_fetch_token() -> str | None:
     try:
         r = requests.post(
             "https://id.twitch.tv/oauth2/token",
-            data={
-                "client_id": TWITCH_CLIENT_ID,
-                "client_secret": TWITCH_CLIENT_SECRET,
-                "grant_type": "client_credentials",
-            },
+            data={"client_id": TWITCH_CLIENT_ID, "client_secret": TWITCH_CLIENT_SECRET, "grant_type": "client_credentials"},
             timeout=20,
         )
         r.raise_for_status()
@@ -349,13 +277,9 @@ def _tw_fetch_token() -> str | None:
     return None
 
 def twitch_check_live() -> dict | None:
-    """
-    Возвращает {'id': stream_id, 'title': title} если обнаружен НОВЫЙ эфир, иначе None.
-    """
     global last_twitch_stream_id
     if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and TWITCH_USERNAME):
         return None
-
     tk = _tw_fetch_token()
     if not tk:
         return None
@@ -374,7 +298,6 @@ def twitch_check_live() -> dict | None:
         s = data[0]
         sid = s.get("id")
         title = s.get("title")
-        # Если новый stream_id — считаем это свежим стартом
         if sid and sid != last_twitch_stream_id:
             return {"id": sid, "title": title}
         return None
@@ -387,7 +310,6 @@ def twitch_check_live() -> dict | None:
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
             print(f"[TW] streams HTTP {e.response.status_code}: retry with fresh token")
-            # сброс токена и одна повторная попытка
             global _tw_token, _tw_token_expire_at
             _tw_token = None
             _tw_token_expire_at = 0
@@ -410,14 +332,8 @@ def twitch_check_live() -> dict | None:
 
 # ==================== ОСНОВНАЯ ЛОГИКА ====================
 async def _announce_with_sources(app: Application, title: str, yt_video: dict | None):
-    """
-    Собираем пост:
-      - фото: превью YouTube (если есть) иначе STATIC_IMAGE_URL
-      - кнопки: YouTube → на стрим, если знаем id; иначе на канал
-    """
     yt_id = yt_video["id"] if yt_video else None
     photo_url = (yt_video.get("thumb") if (yt_video and yt_video.get("thumb")) else STATIC_IMAGE_URL)
-
     text = (
         "🔴 <b>Стрим начался! Забегай, я тебя жду :)</b>\n\n"
         f"<b>{title or ''}</b>\n\n"
@@ -427,10 +343,6 @@ async def _announce_with_sources(app: Application, title: str, yt_video: dict | 
     await tg_broadcast_photo_first(app, text, kb, photo_url)
 
 async def minute_loop(app: Application):
-    """
-    Самый простой «будильник»: каждые 60 сек проверяем Twitch.
-    Работает и в режиме вебхуков, фоновой таской внутри процесса.
-    """
     print(f"[WAKE] minute loop started at {now_local().isoformat()}")
     while True:
         try:
@@ -444,13 +356,9 @@ async def minute_loop(app: Application):
                 _last_called_ts["tw"] = int(time.time())
         except Exception as e:
             print(f"[WAKE] loop error: {e}")
-        await asyncio.sleep(5)  # короткий сон, чтобы не жрать CPU
+        await asyncio.sleep(5)
 
 async def self_ping():
-    """
-    Периодический self-ping, чтобы Render (или другой бесплатный хост) не усыплял сервис.
-    Раз в 10 минут дергаем PUBLIC_URL/_wake. 404 тоже засчитывается как трафик.
-    """
     if not PUBLIC_URL:
         print("[SELF-PING] skipped: PUBLIC_URL is empty")
         return
@@ -463,21 +371,17 @@ async def self_ping():
                     print(f"[SELF-PING] status={resp.status}")
         except Exception as e:
             print(f"[SELF-PING] error: {e}")
-        await asyncio.sleep(600)  # каждые 10 минут
+        await asyncio.sleep(600)
 
 # ==================== КОМАНДЫ ====================
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Тестовый пост с логикой превью:
-      - пробуем 3× получить YouTube live и превью
-      - если не нашли — берём статичную картинку
-    """
     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
     title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
     await _announce_with_sources(context.application, title, yt_live)
     try:
         if update.effective_message:
-            await update.effective_message.reply_text("Тест: отправил анонс в целевые чаты/каналы.")
+            await update.effective_message.reply_text("Тест: отправил анонс в целевые чаты/каналы.",
+                                                      reply_markup=main_reply_kb())
     except Exception:
         pass
 
@@ -487,7 +391,8 @@ async def _ensure_tasks_env(update: Update) -> bool:
         if update.effective_message:
             await update.effective_message.reply_text(
                 "❗ Не настроен доступ к Google Tasks. "
-                "Нужны GOOGLE_TASKS_CLIENT_ID / SECRET / REFRESH_TOKEN / LIST_ID в ENV."
+                "Нужны GOOGLE_TASKS_CLIENT_ID / SECRET / REFRESH_TOKEN / LIST_ID в ENV.",
+                reply_markup=main_reply_kb(),
             )
         return False
     return True
@@ -497,14 +402,10 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tasks = _tasks_fetch_all()
     today = now_local().date()
-    todays = []
-    for t in tasks:
-        d = _due_to_local_date(t.get("due") or "")
-        if d == today:
-            todays.append(t)
+    todays = [t for t in tasks if _due_to_local_date(t.get("due") or "") == today]
     text = _format_tasks_list(todays, "📅 Стримы сегодня")
     if update.effective_message:
-        await update.effective_message.reply_text(text)
+        await update.effective_message.reply_text(text, reply_markup=main_reply_kb())
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _ensure_tasks_env(update):
@@ -512,25 +413,17 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tasks = _tasks_fetch_all()
     today = now_local().date()
     end = today + timedelta(days=7)
-    weeks = []
-    for t in tasks:
-        d = _due_to_local_date(t.get("due") or "")
-        if d and today <= d <= end:
-            weeks.append(t)
-    text = _format_tasks_list(weeks, "📅 Стримы на неделю")
+    weeks = [t for t in tasks if (d := _due_to_local_date(t.get("due") or "")) and today <= d <= end]
+    text = _format_tasks_list(weeks, "🗓 Стримы на неделю")
     if update.effective_message:
-        await update.effective_message.reply_text(text)
+        await update.effective_message.reply_text(text, reply_markup=main_reply_kb())
 
 async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _ensure_tasks_env(update):
         return
     tasks = _tasks_fetch_all()
     today = now_local().date()
-    upcoming = []
-    for t in tasks:
-        d = _due_to_local_date(t.get("due") or "")
-        if d and d >= today:
-            upcoming.append(t)
+    upcoming = [t for t in tasks if (d := _due_to_local_date(t.get("due") or "")) and d >= today]
     if upcoming:
         def sort_key(t: dict):
             d = _due_to_local_date(t.get("due") or "")
@@ -541,9 +434,29 @@ async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         next_list = [upcoming[0]]
     else:
         next_list = []
-    text = _format_tasks_list(next_list, "📅 Ближайший стрим")
+    text = _format_tasks_list(next_list, "⏭ Ближайший стрим")
     if update.effective_message:
-        await update.effective_message.reply_text(text)
+        await update.effective_message.reply_text(text, reply_markup=main_reply_kb())
+
+# ---- Меню /start /menu + текстовые кнопки без слеша ----
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_message:
+        await update.effective_message.reply_text("Выбери действие:", reply_markup=main_reply_kb())
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^а-яa-zёйцукенгшщзхъфывапролджэячсмитьбю\s]", "", s.lower()).strip()
+
+async def on_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Обработка текстов от ReplyKeyboard
+    if not update.effective_message or not update.effective_message.text:
+        return
+    text = _norm(update.effective_message.text)
+    if text in ("сегодня", "📅 сегодня"):
+        await cmd_today(update, context)
+    elif text in ("неделя", "🗓 неделя"):
+        await cmd_week(update, context)
+    elif text in ("ближайший", "⏭ ближайший"):
+        await cmd_next(update, context)
 
 # ==================== ERROR-HANDLER ====================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -558,7 +471,29 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== STARTUP ====================
 async def _on_start(app: Application):
-    # Запускаем фоновые задачи
+    # 1) Регистрируем команды (видны при вводе '/')
+    await app.bot.set_my_commands([
+        BotCommand("segodnya", "📅 Стримы сегодня"),
+        BotCommand("nedelya", "🗓 Стримы на неделю"),
+        BotCommand("blizhayshiy", "⏭ Ближайший стрим"),
+        BotCommand("today", "📅 Today (англ. алиас)"),
+        BotCommand("week", "🗓 Week (англ. алиас)"),
+        BotCommand("next", "⏭ Next (англ. алиас)"),
+        BotCommand("menu", "Открыть меню-клавиатуру"),
+        BotCommand("test", "🔧 Тестовый пост"),
+    ])
+
+    # 2) Покажем постоянную клавиатуру в указанных чатах (группах),
+    #    чтобы участники видели кнопки сразу после деплоя.
+    for chat_id in CHAT_IDS:
+        try:
+            await app.bot.send_message(chat_id=chat_id,
+                                       text="Меню бота:",
+                                       reply_markup=main_reply_kb())
+        except Exception as e:
+            print(f"[STARTED] cannot show keyboard in {chat_id}: {e}")
+
+    # 3) Фоновые задачи
     asyncio.create_task(minute_loop(app))
     asyncio.create_task(self_ping())
     print(f"[STARTED] {BOT_NAME} at {now_local().isoformat()}")
@@ -566,7 +501,6 @@ async def _on_start(app: Application):
 def main():
     if not TG_TOKEN or not CHAT_IDS:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS in Environment")
-
     if not PUBLIC_URL:
         raise SystemExit("Set PUBLIC_URL (https://<your-host>) for webhook (или используйте RENDER_EXTERNAL_URL)")
 
@@ -577,23 +511,28 @@ def main():
         .build()
     )
 
-    # Команды
-    application.add_handler(CommandHandler("test", cmd_test))
-    application.add_handler(CommandHandler("today", cmd_today))
-    application.add_handler(CommandHandler("week", cmd_week))
-    application.add_handler(CommandHandler("next", cmd_next))
+    # Команды (латинские имена + алиасы)
+    application.add_handler(CommandHandler(["test"], cmd_test))
+    application.add_handler(CommandHandler(["today", "segodnya"], cmd_today))
+    application.add_handler(CommandHandler(["week", "nedelya"], cmd_week))
+    application.add_handler(CommandHandler(["next", "blizhayshiy"], cmd_next))
+    application.add_handler(CommandHandler(["menu", "start"], cmd_menu))
+
+    # Обработка текстовых кнопок (ReplyKeyboard) без слеша
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_buttons))
+
     application.add_error_handler(on_error)
 
-    # Поднимаем встроенный веб-сервер и регистрируем вебхук в Telegram
+    # Вебхук
     webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
     print(f"[WEBHOOK] listen 0.0.0.0:{PORT}  path={WEBHOOK_PATH}  url={webhook_url}")
 
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path=WEBHOOK_PATH,         # локальный путь, по которому будет принимать апдейты
-        webhook_url=webhook_url,       # публичный URL для Telegram setWebhook
-        secret_token=WEBHOOK_SECRET,   # X-Telegram-Bot-Api-Secret-Token
+        url_path=WEBHOOK_PATH,
+        webhook_url=webhook_url,
+        secret_token=WEBHOOK_SECRET,
         drop_pending_updates=True,
         allowed_updates=None,
     )
