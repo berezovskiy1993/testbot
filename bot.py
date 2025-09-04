@@ -2,7 +2,8 @@ import os
 import time
 import asyncio
 import re
-from datetime import datetime, timedelta, timezone, date  # важно: date импортирован
+import calendar
+from datetime import datetime, timedelta, timezone, date
 
 import requests
 import aiohttp  # нужен для self-ping
@@ -14,7 +15,14 @@ from telegram import (
     ReplyKeyboardMarkup,
     BotCommand,
 )
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
 from telegram.error import Conflict, TimedOut, NetworkError, BadRequest
 
 BOT_NAME = "dektrian_online_bot"
@@ -47,6 +55,15 @@ TWITCH_USERNAME = os.getenv("TWITCH_USERNAME", "dektrian_tv").strip()
 # Картинка для постов (желательно прямой URL на изображение)
 STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
 
+# Соцсети (опц.): если не заданы, будут разумные дефолты
+SOC_YT = os.getenv("SOCIAL_YOUTUBE", "").strip()
+SOC_TWITCH = os.getenv("SOCIAL_TWITCH", "").strip()
+SOC_TG = os.getenv("SOCIAL_TELEGRAM", "https://t.me/DektrianTV").strip()
+SOC_TIKTOK = os.getenv("SOCIAL_TIKTOK", "").strip()
+SOC_IG = os.getenv("SOCIAL_INSTAGRAM", "").strip()
+SOC_X = os.getenv("SOCIAL_X", "").strip()
+SOC_DISCORD = os.getenv("SOCIAL_DISCORD", "").strip()
+
 # Параметры вебхука
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 PORT = int(os.getenv("PORT", os.getenv("RENDER_PORT", "8080")))
@@ -66,6 +83,9 @@ def now_local() -> datetime:
 def _sec_since(ts: int) -> int:
     return int(time.time()) - ts
 
+def html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 # ==================== TELEGRAM UI ====================
 def build_keyboard(youtube_video_id: str | None) -> InlineKeyboardMarkup:
     yt_url = (
@@ -82,27 +102,11 @@ def build_keyboard(youtube_video_id: str | None) -> InlineKeyboardMarkup:
     ])
 
 def main_reply_kb() -> ReplyKeyboardMarkup:
-    # Постоянная клавиатура с русскими кнопками (без слеша)
     rows = [
         [KeyboardButton("📅 Сегодня"), KeyboardButton("🗓 Неделя")],
-        [KeyboardButton("⏭ Ближайший")],
+        [KeyboardButton("📆 Месяц"), KeyboardButton("☰ Меню")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
-
-async def tg_broadcast_photo_first(app: Application, text: str, kb: InlineKeyboardMarkup | None, photo_url: str):
-    for chat_id in CHAT_IDS:
-        try:
-            await app.bot.send_photo(chat_id=chat_id, photo=photo_url, caption=text, parse_mode="HTML", reply_markup=kb)
-            continue
-        except BadRequest as e:
-            print(f"[TG] photo send failed for {chat_id}: {e}. Fallback to link+message.")
-        except Exception as e:
-            print(f"[TG] photo send error to {chat_id}: {e}. Fallback to link+message.")
-        try:
-            await app.bot.send_message(chat_id=chat_id, text=f"{photo_url}\n\n{text}", parse_mode="HTML",
-                                       reply_markup=kb, disable_web_page_preview=False)
-        except Exception as e:
-            print(f"[TG] message send error to {chat_id}: {e}")
 
 # ==================== GOOGLE TASKS (helpers) ====================
 def _tasks_get_access_token() -> str | None:
@@ -154,17 +158,23 @@ def _tasks_fetch_all() -> list[dict]:
     return items
 
 _time_re = re.compile(r"(^|\s)(\d{1,2}):(\d{2})(\b)")
+_mention_re = re.compile(r"@\w+")
+
+def _clean_title(title: str) -> str:
+    if not title:
+        return "Без названия"
+    t = _mention_re.sub("", title)  # убираем @юзернеймы
+    t = re.sub(r"\s{2,}", " ", t).strip(" —-").strip()
+    return t or "Без названия"
 
 def _extract_time_from_title(title: str) -> tuple[str | None, str]:
-    if not title:
-        return None, "Без названия"
+    title = title or ""
     m = _time_re.search(title)
     if not m:
-        return None, title.strip()
+        return None, _clean_title(title)
     hhmm = f"{m.group(2)}:{m.group(3)}"
-    cleaned = title[:m.start()].strip() + " " + title[m.end():].strip()
-    cleaned = cleaned.strip() or title.strip()
-    return hhmm, cleaned
+    cleaned = (title[:m.start()].strip() + " " + title[m.end():].strip()).strip()
+    return hhmm, _clean_title(cleaned)
 
 def _due_to_local_date(due_iso: str) -> date | None:
     if not due_iso:
@@ -179,22 +189,61 @@ def _due_to_local_date(due_iso: str) -> date | None:
         except Exception:
             return None
 
-def _format_tasks_list(tasks: list[dict], header: str) -> str:
-    if not tasks:
-        return f"{header}\n\nНет стримов в расписании."
-    def sort_key(t: dict):
+def _daterange_days(start: date, end: date):
+    d = start
+    while d <= end:
+        yield d
+        d += timedelta(days=1)
+
+def _tasks_by_date_map(tasks: list[dict]) -> dict[date, list[dict]]:
+    out: dict[date, list[dict]] = {}
+    for t in tasks:
         d = _due_to_local_date(t.get("due") or "")
-        time_in_title, _ = _extract_time_from_title(t.get("title") or "")
-        time_sort = time_in_title or "99:99"
-        return (d or datetime(2100, 1, 1).date(), time_sort)
-    tasks_sorted = sorted(tasks, key=sort_key)
-    lines = [header, ""]
-    for t in tasks_sorted:
-        title = t.get("title") or "Без названия"
-        d = _due_to_local_date(t.get("due") or "")
-        date_str = d.strftime("%d.%m (%a)") if d else "без даты"
-        hhmm, cleaned_title = _extract_time_from_title(title)
-        lines.append(f"▫️ {date_str} {hhmm + ' ' if hhmm else ''}— {cleaned_title}")
+        if not d:
+            continue
+        out.setdefault(d, []).append(t)
+    return out
+
+def _weekday_abr(d: date) -> str:
+    # оставим англ. аббревиатуры, как у тебя в примерах
+    return d.strftime("%a")
+
+def _format_table_for_range(tasks: list[dict], start: date, end: date, title: str) -> str:
+    """
+    Красивое моноширинное «табличное» представление.
+    Колонки: Дата | Дн | Время | Событие
+    Пустые даты -> "--" и "нет стримов"
+    """
+    m = _tasks_by_date_map(tasks)
+
+    lines = []
+    header = f"{title}\n"
+    lines.append(html_escape(header))
+    lines.append("<pre>")
+    lines.append("Дата     Дн  Время  Событие")
+    lines.append("-------- --- -----  ------------------------------")
+    for d in _daterange_days(start, end):
+        day = d.strftime("%d.%m")
+        wd = _weekday_abr(d)
+        day_tasks = m.get(d, [])
+        if not day_tasks:
+            lines.append(f"{day:8} {wd:3} {'--':5}  нет стримов")
+            continue
+        # на день может быть несколько задач — покажем построчно
+        day_tasks_sorted = sorted(
+            day_tasks,
+            key=lambda t: (_extract_time_from_title(t.get('title') or "")[0] or "99:99")
+        )
+        first = True
+        for t in day_tasks_sorted:
+            hhmm, cleaned_title = _extract_time_from_title(t.get("title") or "")
+            time_str = hhmm or "--"
+            if first:
+                lines.append(f"{day:8} {wd:3} {time_str:5}  {html_escape(cleaned_title)}")
+                first = False
+            else:
+                lines.append(f"{'':8} {'':3} {time_str:5}  {html_escape(cleaned_title)}")
+    lines.append("</pre>")
     return "\n".join(lines)
 
 # ==================== YOUTUBE ====================
@@ -336,7 +385,7 @@ async def _announce_with_sources(app: Application, title: str, yt_video: dict | 
     photo_url = (yt_video.get("thumb") if (yt_video and yt_video.get("thumb")) else STATIC_IMAGE_URL)
     text = (
         "🔴 <b>Стрим начался! Забегай, я тебя жду :)</b>\n\n"
-        f"<b>{title or ''}</b>\n\n"
+        f"<b>{html_escape(title or '')}</b>\n\n"
         "#DEKTRIAN #D13 #ОНЛАЙН"
     )
     kb = build_keyboard(yt_id)
@@ -373,19 +422,7 @@ async def self_ping():
             print(f"[SELF-PING] error: {e}")
         await asyncio.sleep(600)
 
-# ==================== КОМАНДЫ ====================
-async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
-    title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
-    await _announce_with_sources(context.application, title, yt_live)
-    try:
-        if update.effective_message:
-            await update.effective_message.reply_text("Тест: отправил анонс в целевые чаты/каналы.",
-                                                      reply_markup=main_reply_kb())
-    except Exception:
-        pass
-
-# ---- Новые команды с Google Tasks ----
+# ==================== КОМАНДЫ (Tasks) ====================
 async def _ensure_tasks_env(update: Update) -> bool:
     if not (GOOGLE_TASKS_CLIENT_ID and GOOGLE_TASKS_CLIENT_SECRET and GOOGLE_TASKS_REFRESH_TOKEN and GOOGLE_TASKS_LIST_ID):
         if update.effective_message:
@@ -401,62 +438,132 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _ensure_tasks_env(update):
         return
     tasks = _tasks_fetch_all()
-    today = now_local().date()
-    todays = [t for t in tasks if _due_to_local_date(t.get("due") or "") == today]
-    text = _format_tasks_list(todays, "📅 Стримы сегодня")
+    d = now_local().date()
+    text = _format_table_for_range(tasks, d, d, f"📅 Сегодня — {d.strftime('%d.%m.%Y')}")
     if update.effective_message:
-        await update.effective_message.reply_text(text, reply_markup=main_reply_kb())
+        await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=main_reply_kb())
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _ensure_tasks_env(update):
         return
     tasks = _tasks_fetch_all()
-    today = now_local().date()
-    end = today + timedelta(days=7)
-    weeks = [t for t in tasks if (d := _due_to_local_date(t.get("due") or "")) and today <= d <= end]
-    text = _format_tasks_list(weeks, "🗓 Стримы на неделю")
+    start = now_local().date()
+    end = start + timedelta(days=6)
+    text = _format_table_for_range(tasks, start, end, f"🗓 Неделя — {start.strftime('%d.%m')}–{end.strftime('%d.%m')}")
     if update.effective_message:
-        await update.effective_message.reply_text(text, reply_markup=main_reply_kb())
+        await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=main_reply_kb())
 
-async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ====== /month с инлайн-переключением недель ======
+def _month_weeks(year: int, month: int) -> list[tuple[date, date]]:
+    last_day = calendar.monthrange(year, month)[1]
+    weeks = []
+    d = date(year, month, 1)
+    while d.month == month:
+        start = d
+        end = min(date(year, month, last_day), start + timedelta(days=6))
+        weeks.append((start, end))
+        d = end + timedelta(days=1)
+    return weeks  # 4-5 недель
+
+def _month_title(year: int, month: int, idx: int, total: int) -> str:
+    ru_months = ["", "Январь","Февраль","Март","Апрель","Май","Июнь","Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
+    return f"📆 {ru_months[month]} {year} — Неделя {idx+1}/{total}"
+
+def _month_kb(ym: str, idx: int, total: int) -> InlineKeyboardMarkup:
+    # ym = "YYYY-MM"
+    prev_idx = (idx - 1) % total
+    next_idx = (idx + 1) % total
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️", callback_data=f"m|{ym}|{prev_idx}"),
+         InlineKeyboardButton(f"Неделя {idx+1}/{total}", callback_data=f"m|{ym}|{idx}"),
+         InlineKeyboardButton("▶️", callback_data=f"m|{ym}|{next_idx}")],
+    ])
+
+async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _ensure_tasks_env(update):
         return
-    tasks = _tasks_fetch_all()
     today = now_local().date()
-    upcoming = [t for t in tasks if (d := _due_to_local_date(t.get("due") or "")) and d >= today]
-    if upcoming:
-        def sort_key(t: dict):
-            d = _due_to_local_date(t.get("due") or "")
-            time_in_title, _ = _extract_time_from_title(t.get("title") or "")
-            time_sort = time_in_title or "99:99"
-            return (d or datetime(2100, 1, 1).date(), time_sort)
-        upcoming.sort(key=sort_key)
-        next_list = [upcoming[0]]
-    else:
-        next_list = []
-    text = _format_tasks_list(next_list, "⏭ Ближайший стрим")
+    year, month = today.year, today.month
+    weeks = _month_weeks(year, month)
+    idx = 0
+    tasks = _tasks_fetch_all()
+    start, end = weeks[idx]
+    text = _format_table_for_range(tasks, start, end, _month_title(year, month, idx, len(weeks)))
+    kb = _month_kb(f"{year:04d}-{month:02d}", idx, len(weeks))
     if update.effective_message:
-        await update.effective_message.reply_text(text, reply_markup=main_reply_kb())
+        await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
-# ---- Меню /start /menu + текстовые кнопки без слеша ----
+async def on_month_nav(query_data: str, query, context: ContextTypes.DEFAULT_TYPE):
+    # query_data: "m|YYYY-MM|idx"
+    try:
+        _, ym, idx_str = query_data.split("|")
+        year, month = map(int, ym.split("-"))
+        idx = int(idx_str)
+    except Exception:
+        return
+    tasks = _tasks_fetch_all()
+    weeks = _month_weeks(year, month)
+    if not weeks:
+        return
+    idx = max(0, min(idx, len(weeks)-1))
+    start, end = weeks[idx]
+    text = _format_table_for_range(tasks, start, end, _month_title(year, month, idx, len(weeks)))
+    kb = _month_kb(ym, idx, len(weeks))
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    except BadRequest:
+        # Если текст идентичен — просто обновим клаву
+        await query.edit_message_reply_markup(reply_markup=kb)
+
+# ==================== КОМАНДЫ: меню и кнопки ====================
+def _main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Сегодня", callback_data="t|today"),
+         InlineKeyboardButton("🗓 Неделя", callback_data="t|week")],
+        [InlineKeyboardButton("📆 Месяц", callback_data="t|month")],
+        [InlineKeyboardButton("Бронь стрима", url="https://t.me/DektrianTV")],
+        [InlineKeyboardButton("Купить юси", url="https://t.me/uc_pubg_bounty")],
+        [InlineKeyboardButton("Вступить в клан", url="https://t.me/D13_join_bot")],
+        [InlineKeyboardButton("Соцсети стримера", callback_data="menu|socials")],
+    ])
+
+def _socials_kb() -> InlineKeyboardMarkup:
+    yt = SOC_YT or (f"https://www.youtube.com/channel/{YT_CHANNEL_ID}" if YT_CHANNEL_ID else "https://www.youtube.com/@dektrian_tv")
+    tw = SOC_TWITCH or (f"https://www.twitch.tv/{TWITCH_USERNAME}" if TWITCH_USERNAME else "https://www.twitch.tv/")
+    tg = SOC_TG or "https://t.me/DektrianTV"
+    rows = [
+        [InlineKeyboardButton("YouTube", url=yt),
+         InlineKeyboardButton("Twitch", url=tw)],
+        [InlineKeyboardButton("Telegram", url=tg)],
+    ]
+    if SOC_TIKTOK:
+        rows.append([InlineKeyboardButton("TikTok", url=SOC_TIKTOK)])
+    if SOC_IG:
+        rows.append([InlineKeyboardButton("Instagram", url=SOC_IG)])
+    if SOC_X:
+        rows.append([InlineKeyboardButton("X / Twitter", url=SOC_X)])
+    if SOC_DISCORD:
+        rows.append([InlineKeyboardButton("Discord", url=SOC_DISCORD)])
+    rows.append([InlineKeyboardButton("← Назад", callback_data="menu|main")])
+    return InlineKeyboardMarkup(rows)
+
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_message:
-        await update.effective_message.reply_text("Выбери действие:", reply_markup=main_reply_kb())
+        await update.effective_message.reply_text("Меню бота:", reply_markup=_main_menu_kb())
 
-def _norm(s: str) -> str:
-    return re.sub(r"[^а-яa-zёйцукенгшщзхъфывапролджэячсмитьбю\s]", "", s.lower()).strip()
+async def on_menu_nav(query_data: str, query, context: ContextTypes.DEFAULT_TYPE):
+    if query_data == "menu|socials":
+        await query.edit_message_text("Соцсети стримера:", reply_markup=_socials_kb())
+    elif query_data == "menu|main":
+        await query.edit_message_text("Меню бота:", reply_markup=_main_menu_kb())
 
-async def on_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Обработка текстов от ReplyKeyboard
-    if not update.effective_message or not update.effective_message.text:
-        return
-    text = _norm(update.effective_message.text)
-    if text in ("сегодня", "📅 сегодня"):
-        await cmd_today(update, context)
-    elif text in ("неделя", "🗓 неделя"):
-        await cmd_week(update, context)
-    elif text in ("ближайший", "⏭ ближайший"):
-        await cmd_next(update, context)
+# ==================== КОМАНДЫ: тест анонса ====================
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
+    title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
+    await _announce_with_sources(context.application, title, yt_live)
+    if update.effective_message:
+        await update.effective_message.reply_text("Тест: отправил анонс.", reply_markup=main_reply_kb())
 
 # ==================== ERROR-HANDLER ====================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -471,25 +578,19 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== STARTUP ====================
 async def _on_start(app: Application):
-    # 1) Регистрируем команды (видны при вводе '/')
+    # 1) Команды (только латиница)
     await app.bot.set_my_commands([
-        BotCommand("segodnya", "📅 Стримы сегодня"),
-        BotCommand("nedelya", "🗓 Стримы на неделю"),
-        BotCommand("blizhayshiy", "⏭ Ближайший стрим"),
-        BotCommand("today", "📅 Today (англ. алиас)"),
-        BotCommand("week", "🗓 Week (англ. алиас)"),
-        BotCommand("next", "⏭ Next (англ. алиас)"),
-        BotCommand("menu", "Открыть меню-клавиатуру"),
+        BotCommand("today", "📅 Стримы сегодня"),
+        BotCommand("week", "🗓 Стримы на неделю"),
+        BotCommand("month", "📆 Стримы за месяц (по неделям)"),
+        BotCommand("menu", "Открыть меню"),
         BotCommand("test", "🔧 Тестовый пост"),
     ])
 
-    # 2) Покажем постоянную клавиатуру в указанных чатах (группах),
-    #    чтобы участники видели кнопки сразу после деплоя.
+    # 2) Покажем постоянную клавиатуру в целевых чатах
     for chat_id in CHAT_IDS:
         try:
-            await app.bot.send_message(chat_id=chat_id,
-                                       text="Меню бота:",
-                                       reply_markup=main_reply_kb())
+            await app.bot.send_message(chat_id=chat_id, text="Меню бота:", reply_markup=main_reply_kb())
         except Exception as e:
             print(f"[STARTED] cannot show keyboard in {chat_id}: {e}")
 
@@ -497,6 +598,40 @@ async def _on_start(app: Application):
     asyncio.create_task(minute_loop(app))
     asyncio.create_task(self_ping())
     print(f"[STARTED] {BOT_NAME} at {now_local().isoformat()}")
+
+# ==================== ROUTING ====================
+async def on_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message or not update.effective_message.text:
+        return
+    text = update.effective_message.text.strip().lower()
+    if "сегодня" in text:
+        await cmd_today(update, context)
+    elif "неделя" in text:
+        await cmd_week(update, context)
+    elif "месяц" in text:
+        await cmd_month(update, context)
+    elif "меню" in text:
+        await cmd_menu(update, context)
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.callback_query:
+        return
+    q = update.callback_query
+    data = q.data or ""
+    await q.answer()  # краткий ack
+    if data.startswith("m|"):         # month weeks nav
+        await on_month_nav(data, q, context)
+    elif data.startswith("menu|"):     # menus
+        await on_menu_nav(data, q, context)
+    elif data.startswith("t|"):        # trigger today/week/month from inline menu
+        action = data.split("|", 1)[1]
+        dummy_update = Update(update.update_id, message=q.message)  # переиспользуем message для вывода
+        if action == "today":
+            await cmd_today(dummy_update, context)
+        elif action == "week":
+            await cmd_week(dummy_update, context)
+        elif action == "month":
+            await cmd_month(dummy_update, context)
 
 def main():
     if not TG_TOKEN or not CHAT_IDS:
@@ -511,15 +646,18 @@ def main():
         .build()
     )
 
-    # Команды (латинские имена + алиасы)
-    application.add_handler(CommandHandler(["test"], cmd_test))
-    application.add_handler(CommandHandler(["today", "segodnya"], cmd_today))
-    application.add_handler(CommandHandler(["week", "nedelya"], cmd_week))
-    application.add_handler(CommandHandler(["next", "blizhayshiy"], cmd_next))
-    application.add_handler(CommandHandler(["menu", "start"], cmd_menu))
+    # Команды
+    application.add_handler(CommandHandler("test", cmd_test))
+    application.add_handler(CommandHandler("today", cmd_today))
+    application.add_handler(CommandHandler("week", cmd_week))
+    application.add_handler(CommandHandler("month", cmd_month))
+    application.add_handler(CommandHandler("menu", cmd_menu))
 
-    # Обработка текстовых кнопок (ReplyKeyboard) без слеша
+    # Текстовые кнопки (ReplyKeyboard)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_buttons))
+
+    # Callback-кнопки (InlineKeyboard)
+    application.add_handler(CallbackQueryHandler(on_callback))
 
     application.add_error_handler(on_error)
 
