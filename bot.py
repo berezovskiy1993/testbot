@@ -57,7 +57,7 @@ STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip(
 
 # Ежедневные напоминания
 DAILY_POST_ENABLED = (os.getenv("DAILY_POST_ENABLED", "1").strip() or "1")
-DAILY_POST_TIMES = os.getenv("DAILY_POST_TIMES", "12:30,12:27").strip()
+DAILY_POST_TIMES = os.getenv("DAILY_POST_TIMES", "12:35,12:37").strip()
 DAILY_POST_IMAGE_URL = os.getenv("DAILY_POST_IMAGE_URL", "").strip()  # опционально
 
 # Параметры вебхука
