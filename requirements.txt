@@ -1,2 +1,2 @@
-python-telegram-bot==21.*
+python-telegram-bot[webhooks]==21.11.1
 requests>=2.31,<3
