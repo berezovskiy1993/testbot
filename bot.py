@@ -55,7 +55,7 @@ TWITCH_USERNAME = os.getenv("TWITCH_USERNAME", "dektrian_tv").strip()
 # Картинка для постов (желательно прямой URL на изображение)
 STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
 
-# Соцсети (опц.): если не заданы, будут разумные дефолты
+# Соцсети (опционально из ENV — но раздел соцсетей в меню ниже задан жёстко)
 SOC_YT = os.getenv("SOCIAL_YOUTUBE", "").strip()
 SOC_TWITCH = os.getenv("SOCIAL_TWITCH", "").strip()
 SOC_TG = os.getenv("SOCIAL_TELEGRAM", "https://t.me/DektrianTV").strip()
@@ -205,13 +205,12 @@ def _tasks_by_date_map(tasks: list[dict]) -> dict[date, list[dict]]:
     return out
 
 def _weekday_abr(d: date) -> str:
-    # оставим англ. аббревиатуры, как у тебя в примерах
-    return d.strftime("%a")
+    return d.strftime("%a")  # англ. аббревиатуры
 
 def _format_table_for_range(tasks: list[dict], start: date, end: date, title: str) -> str:
     """
-    Красивое моноширинное «табличное» представление.
-    Колонки: Дата | Дн | Время | Событие
+    Моноширинная «таблица»:
+    Дата | Дн | Время | Событие
     Пустые даты -> "--" и "нет стримов"
     """
     m = _tasks_by_date_map(tasks)
@@ -229,7 +228,6 @@ def _format_table_for_range(tasks: list[dict], start: date, end: date, title: st
         if not day_tasks:
             lines.append(f"{day:8} {wd:3} {'--':5}  нет стримов")
             continue
-        # на день может быть несколько задач — покажем построчно
         day_tasks_sorted = sorted(
             day_tasks,
             key=lambda t: (_extract_time_from_title(t.get('title') or "")[0] or "99:99")
@@ -379,7 +377,7 @@ def twitch_check_live() -> dict | None:
         print(f"[TW] error: {e}")
     return None
 
-# ==================== ОСНОВНАЯ ЛОГИКА ====================
+# ==================== АНОНС ====================
 async def _announce_with_sources(app: Application, title: str, yt_video: dict | None):
     yt_id = yt_video["id"] if yt_video else None
     photo_url = (yt_video.get("thumb") if (yt_video and yt_video.get("thumb")) else STATIC_IMAGE_URL)
@@ -391,6 +389,7 @@ async def _announce_with_sources(app: Application, title: str, yt_video: dict | 
     kb = build_keyboard(yt_id)
     await tg_broadcast_photo_first(app, text, kb, photo_url)
 
+# ==================== ФОНОВЫЕ ТАСКИ ====================
 async def minute_loop(app: Application):
     print(f"[WAKE] minute loop started at {now_local().isoformat()}")
     while True:
@@ -463,14 +462,13 @@ def _month_weeks(year: int, month: int) -> list[tuple[date, date]]:
         end = min(date(year, month, last_day), start + timedelta(days=6))
         weeks.append((start, end))
         d = end + timedelta(days=1)
-    return weeks  # 4-5 недель
+    return weeks
 
 def _month_title(year: int, month: int, idx: int, total: int) -> str:
     ru_months = ["", "Январь","Февраль","Март","Апрель","Май","Июнь","Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
     return f"📆 {ru_months[month]} {year} — Неделя {idx+1}/{total}"
 
 def _month_kb(ym: str, idx: int, total: int) -> InlineKeyboardMarkup:
-    # ym = "YYYY-MM"
     prev_idx = (idx - 1) % total
     next_idx = (idx + 1) % total
     return InlineKeyboardMarkup([
@@ -494,7 +492,6 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 async def on_month_nav(query_data: str, query, context: ContextTypes.DEFAULT_TYPE):
-    # query_data: "m|YYYY-MM|idx"
     try:
         _, ym, idx_str = query_data.split("|")
         year, month = map(int, ym.split("-"))
@@ -512,39 +509,31 @@ async def on_month_nav(query_data: str, query, context: ContextTypes.DEFAULT_TYP
     try:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
     except BadRequest:
-        # Если текст идентичен — просто обновим клаву
         await query.edit_message_reply_markup(reply_markup=kb)
 
 # ==================== КОМАНДЫ: меню и кнопки ====================
 def _main_menu_kb() -> InlineKeyboardMarkup:
+    # Две колонки
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Сегодня", callback_data="t|today"),
-         InlineKeyboardButton("🗓 Неделя", callback_data="t|week")],
-        [InlineKeyboardButton("📆 Месяц", callback_data="t|month")],
-        [InlineKeyboardButton("Бронь стрима", url="https://t.me/DektrianTV")],
-        [InlineKeyboardButton("Купить юси", url="https://t.me/uc_pubg_bounty")],
+         InlineKeyboardButton("🗓 Неделя",  callback_data="t|week")],
+        [InlineKeyboardButton("📆 Месяц",   callback_data="t|month"),
+         InlineKeyboardButton("Соцсети стримера", callback_data="menu|socials")],
+        [InlineKeyboardButton("Бронь стрима", url="https://t.me/DektrianTV"),
+         InlineKeyboardButton("Купить юси",   url="https://t.me/uc_pubg_bounty")],
         [InlineKeyboardButton("Вступить в клан", url="https://t.me/D13_join_bot")],
-        [InlineKeyboardButton("Соцсети стримера", callback_data="menu|socials")],
     ])
 
 def _socials_kb() -> InlineKeyboardMarkup:
-    yt = SOC_YT or (f"https://www.youtube.com/channel/{YT_CHANNEL_ID}" if YT_CHANNEL_ID else "https://www.youtube.com/@dektrian_tv")
-    tw = SOC_TWITCH or (f"https://www.twitch.tv/{TWITCH_USERNAME}" if TWITCH_USERNAME else "https://www.twitch.tv/")
-    tg = SOC_TG or "https://t.me/DektrianTV"
+    # Соцсети — строго как ты просил
     rows = [
-        [InlineKeyboardButton("YouTube", url=yt),
-         InlineKeyboardButton("Twitch", url=tw)],
-        [InlineKeyboardButton("Telegram", url=tg)],
+        [InlineKeyboardButton("YouTube", url="https://www.youtube.com/@Dektrian_TV")],
+        [InlineKeyboardButton("Twitch", url="https://www.twitch.tv/dektrian_tv")],
+        [InlineKeyboardButton("Группа Telegram", url="https://t.me/dektrian_tv")],
+        [InlineKeyboardButton("Канал Telegram", url="https://t.me/dektrian_family")],
+        [InlineKeyboardButton("TikTok", url="https://www.tiktok.com/@dektrian_tv")],
+        [InlineKeyboardButton("← Назад", callback_data="menu|main")],
     ]
-    if SOC_TIKTOK:
-        rows.append([InlineKeyboardButton("TikTok", url=SOC_TIKTOK)])
-    if SOC_IG:
-        rows.append([InlineKeyboardButton("Instagram", url=SOC_IG)])
-    if SOC_X:
-        rows.append([InlineKeyboardButton("X / Twitter", url=SOC_X)])
-    if SOC_DISCORD:
-        rows.append([InlineKeyboardButton("Discord", url=SOC_DISCORD)])
-    rows.append([InlineKeyboardButton("← Назад", callback_data="menu|main")])
     return InlineKeyboardMarkup(rows)
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -557,8 +546,9 @@ async def on_menu_nav(query_data: str, query, context: ContextTypes.DEFAULT_TYPE
     elif query_data == "menu|main":
         await query.edit_message_text("Меню бота:", reply_markup=_main_menu_kb())
 
-# ==================== КОМАНДЫ: тест анонса ====================
+# ==================== КОМАНДА: тест анонса ====================
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ВАЖНО: это именно тестовый анонс (не меню)
     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
     title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
     await _announce_with_sources(context.application, title, yt_live)
@@ -578,7 +568,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== STARTUP ====================
 async def _on_start(app: Application):
-    # 1) Команды (только латиница)
+    # 1) Видимые команды (только латиница; /test намеренно НЕ регистрируем)
     await app.bot.set_my_commands([
         BotCommand("today", "📅 Стримы сегодня"),
         BotCommand("week", "🗓 Стримы на неделю"),
@@ -620,11 +610,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()  # краткий ack
     if data.startswith("m|"):         # month weeks nav
         await on_month_nav(data, q, context)
-    elif data.startswith("menu|"):     # menus
+    elif data.startswith("menu|"):    # menus
         await on_menu_nav(data, q, context)
-    elif data.startswith("t|"):        # trigger today/week/month from inline menu
+    elif data.startswith("t|"):       # today/week/month из inline-меню
         action = data.split("|", 1)[1]
-        dummy_update = Update(update.update_id, message=q.message)  # переиспользуем message для вывода
+        dummy_update = Update(update.update_id, message=q.message)
         if action == "today":
             await cmd_today(dummy_update, context)
         elif action == "week":
@@ -646,7 +636,7 @@ def main():
     )
 
     # Команды
-    application.add_handler(CommandHandler("test", cmd_test))
+    application.add_handler(CommandHandler("test", cmd_test))   # скрытая команда, в /help не появляется
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CommandHandler("week", cmd_week))
     application.add_handler(CommandHandler("month", cmd_month))
