@@ -2,7 +2,7 @@ import os
 import time
 import asyncio
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date  # ← добавлен date
 
 import requests
 import aiohttp  # нужен для self-ping
@@ -191,7 +191,7 @@ def _extract_time_from_title(title: str) -> tuple[str | None, str]:
         cleaned = title.strip()
     return hhmm, cleaned
 
-def _due_to_local_date(due_iso: str) -> datetime.date | None:
+def _due_to_local_date(due_iso: str) -> date | None:
     """
     Превращает due (например '2025-09-16T00:00:00.000Z') в локальную дату Europe/Kyiv.
     Для all-day это ок: получится та же дата в местном поясе.
@@ -221,8 +221,7 @@ def _format_tasks_list(tasks: list[dict], header: str) -> str:
     def sort_key(t: dict):
         d = _due_to_local_date(t.get("due") or "")
         time_in_title, _ = _extract_time_from_title(t.get("title") or "")
-        # None -> '99:99' чтобы шло в конец
-        time_sort = time_in_title or "99:99"
+        time_sort = time_in_title or "99:99"  # None -> в конец
         return (d or datetime(2100, 1, 1).date(), time_sort)
 
     tasks_sorted = sorted(tasks, key=sort_key)
@@ -287,7 +286,6 @@ def _yt_fetch_live_once() -> dict | None:
         thumb_url = None
         if vitems:
             thumbs = (vitems[0].get("snippet") or {}).get("thumbnails") or {}
-            # приоритет: maxres > standard > high > medium > default
             for k in ("maxres", "standard", "high", "medium", "default"):
                 if k in thumbs and thumbs[k].get("url"):
                     thumb_url = thumbs[k]["url"]
@@ -478,17 +476,19 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
     await _announce_with_sources(context.application, title, yt_live)
     try:
-        await update.effective_message.reply_text("Тест: отправил анонс в целевые чаты/каналы.")
+        if update.effective_message:
+            await update.effective_message.reply_text("Тест: отправил анонс в целевые чаты/каналы.")
     except Exception:
         pass
 
 # ---- Новые команды с Google Tasks ----
 async def _ensure_tasks_env(update: Update) -> bool:
     if not (GOOGLE_TASKS_CLIENT_ID and GOOGLE_TASKS_CLIENT_SECRET and GOOGLE_TASKS_REFRESH_TOKEN and GOOGLE_TASKS_LIST_ID):
-        await update.message.reply_text(
-            "❗ Не настроен доступ к Google Tasks. "
-            "Нужны GOOGLE_TASKS_CLIENT_ID / SECRET / REFRESH_TOKEN / LIST_ID в ENV."
-        )
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "❗ Не настроен доступ к Google Tasks. "
+                "Нужны GOOGLE_TASKS_CLIENT_ID / SECRET / REFRESH_TOKEN / LIST_ID в ENV."
+            )
         return False
     return True
 
@@ -503,7 +503,8 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if d == today:
             todays.append(t)
     text = _format_tasks_list(todays, "📅 Стримы сегодня")
-    await update.message.reply_text(text)
+    if update.effective_message:
+        await update.effective_message.reply_text(text)
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _ensure_tasks_env(update):
@@ -517,7 +518,8 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if d and today <= d <= end:
             weeks.append(t)
     text = _format_tasks_list(weeks, "📅 Стримы на неделю")
-    await update.message.reply_text(text)
+    if update.effective_message:
+        await update.effective_message.reply_text(text)
 
 async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _ensure_tasks_env(update):
@@ -529,9 +531,7 @@ async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
         d = _due_to_local_date(t.get("due") or "")
         if d and d >= today:
             upcoming.append(t)
-    # берём ближайшую по дате/времени (если время есть в title)
     if upcoming:
-        # используем тот же сортировщик
         def sort_key(t: dict):
             d = _due_to_local_date(t.get("due") or "")
             time_in_title, _ = _extract_time_from_title(t.get("title") or "")
@@ -542,7 +542,8 @@ async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         next_list = []
     text = _format_tasks_list(next_list, "📅 Ближайший стрим")
-    await update.message.reply_text(text)
+    if update.effective_message:
+        await update.effective_message.reply_text(text)
 
 # ==================== ERROR-HANDLER ====================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
