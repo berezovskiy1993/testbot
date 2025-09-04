@@ -13,7 +13,7 @@ BOT_NAME = "dektrian_online_bot"
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 # дефолтные каналы по задаче
-# DEFAULT_CHANNELS = ["@dektrian_family", "@dektrian_tv"]
+DEFAULT_CHANNELS = ["@dektrian_family", "@dektrian_tv"]
 
 _raw_chats = (os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHANNEL_ID") or "").strip()
 _env_chats = [c.strip() for c in _raw_chats.split(",") if c and c.strip()]
