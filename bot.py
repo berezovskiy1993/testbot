@@ -7,7 +7,7 @@ import calendar
 from datetime import datetime, timedelta, timezone, date
 
 import requests
-import aiohttp  # self-ping
+import aiohttp  # self-ping для бесплатного хоста
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -28,61 +28,70 @@ from telegram.error import Conflict, TimedOut, NetworkError, BadRequest
 
 BOT_NAME = "dektrian_online_bot"
 
-# ========= ENV (не обязательно, можно не трогать) =========
+# ========= ENV =========
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
-_raw_chats = (os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHANNEL_ID") or "").strip()
-CHAT_IDS = [c.strip() for c in _raw_chats.split(",") if c.strip()]
-
-# Киев: летом UTC+3, зимой UTC+2 — вручную
-TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "3"))
-
-# === Google Tasks (для расписания) ===
-GOOGLE_TASKS_CLIENT_ID = os.getenv("GOOGLE_TASKS_CLIENT_ID", "").strip()
-GOOGLE_TASKS_CLIENT_SECRET = os.getenv("GOOGLE_TASKS_CLIENT_SECRET", "").strip()
-GOOGLE_TASKS_REFRESH_TOKEN = os.getenv("GOOGLE_TASKS_REFRESH_TOKEN", "").strip()
-GOOGLE_TASKS_LIST_ID = os.getenv("GOOGLE_TASKS_LIST_ID", "").strip()
-
-# YouTube (для превью при старте стрима)
-YT_API_KEY = os.getenv("YT_API_KEY", "").strip()
-YT_CHANNEL_ID = os.getenv("YT_CHANNEL_ID", "").strip()
-
-# Twitch
-TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "").strip()
-TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "").strip()
-TWITCH_USERNAME = os.getenv("TWITCH_USERNAME", "dektrian_tv").strip()
-
-# Картинка для напоминаний по расписанию (легко заменить ссылку)
-SCHEDULE_IMAGE_URL = "https://ibb.co/LXSMV1FQ"
-
-# Параметры вебхука
+# Публичный URL для вебхука (Render и т.п.)
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 PORT = int(os.getenv("PORT", os.getenv("RENDER_PORT", "8080")))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "dektrian-secret")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/telegram/{BOT_NAME}")
 
-# ========= Настраиваемые списки чатов =========
-# 1) Куда постятся анонсы стрима (старт + почасовые пульсы)
-STREAM_CHAT_IDS = [*(CHAT_IDS or [])]  # добавляй/меняй ID тут при необходимости
+# Киев: летом UTC+3, зимой UTC+2 — вручную
+TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "3"))
 
-# 2) Куда постятся напоминания о расписании (10:00/14:00 и т.п.)
-SCHEDULE_CHAT_IDS = [*(CHAT_IDS or [])]  # добавляй/меняй ID тут при необходимости
+# === Google Tasks (для /today /week /month и напоминалок) ===
+GOOGLE_TASKS_CLIENT_ID = os.getenv("GOOGLE_TASKS_CLIENT_ID", "").strip()
+GOOGLE_TASKS_CLIENT_SECRET = os.getenv("GOOGLE_TASKS_CLIENT_SECRET", "").strip()
+GOOGLE_TASKS_REFRESH_TOKEN = os.getenv("GOOGLE_TASKS_REFRESH_TOKEN", "").strip()
+GOOGLE_TASKS_LIST_ID = os.getenv("GOOGLE_TASKS_LIST_ID", "").strip()
 
-# ========= Настраиваемые времена напоминаний (локальное время Киева) =========
-DAILY_REMIND_TIMES = ["10:00", "14:00"]  # легко редактировать
+# YouTube (используется для превью при старте стрима + кнопки)
+YT_API_KEY = os.getenv("YT_API_KEY", "").strip()
+YT_CHANNEL_ID = os.getenv("YT_CHANNEL_ID", "").strip()
 
-# ========= Параметры «пульсов» во время эфира =========
-LIVE_PULSE_MINUTES = 60  # раз в час после старта
-LIVE_PULSE_TEXT = "Мы всё ещё на стриме, врывайся! 😏"
+# Twitch (детект старта стрима)
+TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "").strip()
+TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "").strip()
+TWITCH_USERNAME = os.getenv("TWITCH_USERNAME", "dektrian_tv").strip()
+
+# Картинка по умолчанию для поста о старте стрима
+STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
+
+# Картинка для ежедневных напоминаний о расписании (ЛЕГКО сменить ссылку тут)
+SCHEDULE_IMAGE_URL = os.getenv("SCHEDULE_IMAGE_URL", "https://ibb.co/LXSMV1FQ").strip()
+
+# ===== Чаты для постинга (ЛЕГКО редактировать здесь) =====
+# Сюда летят посты о старте стрима + «мы всё ещё в эфире»
+STREAM_CHAT_IDS = [
+    # Примеры: "-1001234567890"
+]
+# Сюда летят ЕЖЕДНЕВНЫЕ напоминания о стримах на сегодня
+SCHEDULE_CHAT_IDS = [
+    # Примеры: "-1009876543210"
+]
+# Если списки выше пустые, используем TELEGRAM_CHAT_IDS / TELEGRAM_CHANNEL_ID из ENV (обратная совместимость)
+_raw_chats = (os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHANNEL_ID") or "").strip()
+if not STREAM_CHAT_IDS:
+    STREAM_CHAT_IDS = [c.strip() for c in _raw_chats.split(",") if c.strip()]
+if not SCHEDULE_CHAT_IDS:
+    SCHEDULE_CHAT_IDS = [c.strip() for c in _raw_chats.split(",") if c.strip()]
+
+# Ежедневные напоминания (локальное время Киева), НЕ зависят от ENV — меняются тут
+SCHEDULE_POST_TIMES = ["10:00", "14:00"]  # список "HH:MM"
+
+# Параметры периодических «пинков» во время эфира
+LIVE_PING_EVERY_MINUTES = 60   # раз в час
+LIVE_PING_MAX_HOURS = 6        # не более 6 часов напоминаний
 
 # ========= In-memory state =========
 last_twitch_stream_id: str | None = None
 _tw_token: str | None = None
-_tw_token_expire_at: int = 0
+_tw_token_expire_at: int = 0  # unix ts
 _last_called_ts = {"tw": 0}
 
-_live_pulse_task: asyncio.Task | None = None  # фоновые почасовые посты
-_reminder_fired: set[str] = set()  # "YYYY-MM-DD|HH:MM" — чтобы не дублить рассылки
+# Таск периодических «мы всё ещё в эфире»
+_live_ping_task: asyncio.Task | None = None
 
 # ==================== УТИЛИТЫ ====================
 def now_local() -> datetime:
@@ -92,81 +101,82 @@ def _sec_since(ts: int) -> int:
     return int(time.time()) - ts
 
 def html_escape(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+    )
 
-# ==================== ТЕКСТОВЫЕ КНОПКИ (строгие совпадения) ====================
-BTN_EMOJI = "🎮"
-BTN_TODAY = f"{BTN_EMOJI} Сегодня"
-BTN_WEEK = f"{BTN_EMOJI} Неделя"
-BTN_MONTH = f"{BTN_EMOJI} Месяц"
-BTN_MENU = "☰ Меню"
+# ==================== КНОПКИ/МЕНЮ ====================
+# Текстовые кнопки (ReplyKeyboard) — ровно по подписям, чтобы не триггериться на обычные слова
+BTN_TODAY  = "📺 Стрим сегодня"
+BTN_WEEK   = "📺 Стримы неделя"
+BTN_MONTH  = "📺 Стримы месяц"
+BTN_MENU   = "☰ Меню"
 
 def main_reply_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(BTN_TODAY), KeyboardButton(BTN_WEEK)],
         [KeyboardButton(BTN_MONTH), KeyboardButton(BTN_MENU)],
     ]
+    # 2 столбца, закреплённая клавиатура
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
 
-# ==================== TELEGRAM UI ====================
-def _yt_channel_url() -> str:
-    return f"https://www.youtube.com/channel/{YT_CHANNEL_ID}" if YT_CHANNEL_ID else "https://www.youtube.com/@dektrian_tv"
+def _short_stream_kb(youtube_video_id: str | None) -> InlineKeyboardMarkup:
+    """Две кнопки: YouTube и Twitch для «мы ещё в эфире»."""
+    yt_url = (
+        f"https://www.youtube.com/watch?v={youtube_video_id}"
+        if youtube_video_id else
+        (f"https://www.youtube.com/channel/{YT_CHANNEL_ID}" if YT_CHANNEL_ID else "https://www.youtube.com/@dektrian_tv")
+    )
+    tw_url = f"https://www.twitch.tv/{TWITCH_USERNAME}"
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❤️ YouTube", url=yt_url),
+                                  InlineKeyboardButton("💜 Twitch",  url=tw_url)]])
 
-def build_keyboard(youtube_video_id: str | None) -> InlineKeyboardMarkup:
-    yt_url = f"https://www.youtube.com/watch?v={youtube_video_id}" if youtube_video_id else _yt_channel_url()
+def _start_stream_kb(youtube_video_id: str | None) -> InlineKeyboardMarkup:
+    """Полный набор для поста о старте."""
+    yt_url = (
+        f"https://www.youtube.com/watch?v={youtube_video_id}"
+        if youtube_video_id else
+        (f"https://www.youtube.com/channel/{YT_CHANNEL_ID}" if YT_CHANNEL_ID else "https://www.youtube.com/@dektrian_tv")
+    )
     tw_url = f"https://www.twitch.tv/{TWITCH_USERNAME}"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("❤️ Гоу на YouTube", url=yt_url),
          InlineKeyboardButton("💜 Гоу на Twitch",  url=tw_url)],
         [InlineKeyboardButton("💸 Гоу Донатик", url="https://new.donatepay.ru/@Dektrian_TV"),
-         InlineKeyboardButton("🤙 Гоу в клан", url="https://t.me/D13_join_bot")]
+         InlineKeyboardButton("🤙 Гоу в клан",  url="https://t.me/D13_join_bot")]
     ])
 
-def socials_kb_two_cols() -> InlineKeyboardMarkup:
+def _schedule_only_clan_kb() -> InlineKeyboardMarkup:
+    """Для ЕЖЕДНЕВНЫХ напоминаний — только одна кнопка «Вступить в клан»."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🤙 Вступить в клан", url="https://t.me/D13_join_bot")]])
+
+def _main_menu_kb() -> InlineKeyboardMarkup:
+    """Инлайн-меню в ДВА столбца."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Сегодня", callback_data="t|today"),
+         InlineKeyboardButton("🗓 Неделя",  callback_data="t|week")],
+        [InlineKeyboardButton("📆 Месяц",   callback_data="t|month")],
+        [InlineKeyboardButton("Бронь стрима", url="https://t.me/DektrianTV"),
+         InlineKeyboardButton("Купить юси",    url="https://t.me/uc_pubg_bounty")],
+        [InlineKeyboardButton("Вступить в клан", url="https://t.me/D13_join_bot"),
+         InlineKeyboardButton("Соцсети стримера", callback_data="menu|socials")],
+    ])
+
+def _socials_kb() -> InlineKeyboardMarkup:
+    """Соцсети в ДВА столбца + «Назад»."""
     rows = [
         [InlineKeyboardButton("YouTube", url="https://www.youtube.com/@Dektrian_TV"),
-         InlineKeyboardButton("Twitch", url=f"https://www.twitch.tv/{TWITCH_USERNAME}")],
+         InlineKeyboardButton("Twitch",  url="https://www.twitch.tv/dektrian_tv")],
         [InlineKeyboardButton("Группа Telegram", url="https://t.me/dektrian_tv"),
-         InlineKeyboardButton("Канал Telegram", url="https://t.me/dektrian_family")],
+         InlineKeyboardButton("Канал Telegram",  url="https://t.me/dektrian_family")],
         [InlineKeyboardButton("TikTok", url="https://www.tiktok.com/@dektrian_tv"),
          InlineKeyboardButton("← Назад", callback_data="menu|main")],
     ]
     return InlineKeyboardMarkup(rows)
 
-def main_menu_kb() -> InlineKeyboardMarkup:
-    # две колонки
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Сегодня", callback_data="t|today"),
-         InlineKeyboardButton("🗓 Неделя", callback_data="t|week")],
-        [InlineKeyboardButton("📆 Месяц", callback_data="t|month"),
-         InlineKeyboardButton("Соцсети стримера", callback_data="menu|socials")],
-        [InlineKeyboardButton("Бронь стрима", url="https://t.me/DektrianTV"),
-         InlineKeyboardButton("Купить юси", url="https://t.me/uc_pubg_bounty")],
-        [InlineKeyboardButton("Вступить в клан", url="https://t.me/D13_join_bot")],
-    ])
-
-async def tg_broadcast_photo_first(app: Application, text: str, kb: InlineKeyboardMarkup | None, photo_url: str, chat_ids: list[str]):
-    for chat_id in chat_ids:
-        try:
-            await app.bot.send_photo(chat_id=chat_id, photo=photo_url, caption=text, parse_mode="HTML", reply_markup=kb)
-            continue
-        except BadRequest as e:
-            print(f"[TG] photo send failed for {chat_id}: {e}. Fallback to link+message.")
-        except Exception as e:
-            print(f"[TG] photo send error to {chat_id}: {e}. Fallback to link+message.")
-        try:
-            await app.bot.send_message(chat_id=chat_id, text=f"{photo_url}\n\n{text}", parse_mode="HTML", reply_markup=kb, disable_web_page_preview=False)
-        except Exception as e:
-            print(f"[TG] message send error to {chat_id}: {e}")
-
-async def tg_broadcast_message(app: Application, text: str, kb: InlineKeyboardMarkup | None, chat_ids: list[str]):
-    for chat_id in chat_ids:
-        try:
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
-        except Exception as e:
-            print(f"[TG] message send error to {chat_id}: {e}")
-
-# ==================== GOOGLE TASKS ====================
+# ==================== GOOGLE TASKS (helpers) ====================
 def _tasks_get_access_token() -> str | None:
     if not (GOOGLE_TASKS_CLIENT_ID and GOOGLE_TASKS_CLIENT_SECRET and GOOGLE_TASKS_REFRESH_TOKEN and GOOGLE_TASKS_LIST_ID):
         print("[TASKS] Missing env: CLIENT_ID/SECRET/REFRESH_TOKEN/LIST_ID")
@@ -221,7 +231,7 @@ _mention_re = re.compile(r"@\w+")
 def _clean_title(title: str) -> str:
     if not title:
         return "Без названия"
-    t = _mention_re.sub("", title)
+    t = _mention_re.sub("", title)  # убираем @юзернеймы
     t = re.sub(r"\s{2,}", " ", t).strip(" —-").strip()
     return t or "Без названия"
 
@@ -263,24 +273,20 @@ def _tasks_by_date_map(tasks: list[dict]) -> dict[date, list[dict]]:
     return out
 
 def _weekday_abr(d: date) -> str:
-    return d.strftime("%a")
+    return d.strftime("%a")  # англ. аббревиатуры
 
-def _shorten(s: str, max_len: int) -> str:
+def _truncate(s: str, max_len: int) -> str:
     s = s.strip()
-    return s if len(s) <= max_len else (s[: max_len - 1] + "…")
+    return (s if len(s) <= max_len else (s[: max_len - 1] + "…"))
 
-def _format_table_for_range(tasks: list[dict], start: date, end: date, title: str, max_title_len: int = 40) -> str:
+def _format_table_for_range(tasks: list[dict], start: date, end: date, title: str, max_title_len: int = 36) -> str:
     """
-    Моноширинная «таблица»:
-      Дата | Дн | Время | Событие
-    Пустые даты → "-- / нет стримов".
-    Для /today шрифт у Telegram визуально крупнее — ограничиваем длину названия.
+    Моноширинная «таблица». Для /today используем меньший max_title_len, чтобы не было переноса.
+    Колонки: Дата | Дн | Время | Событие. Пустые даты → "--" и "нет стримов".
     """
     m = _tasks_by_date_map(tasks)
-
     lines = []
-    header = f"{title}\n"
-    lines.append(html_escape(header))
+    lines.append(html_escape(title))
     lines.append("<pre>")
     lines.append("Дата     Дн  Время  Событие")
     lines.append("------- ---- ------ ------------------------------")
@@ -293,20 +299,83 @@ def _format_table_for_range(tasks: list[dict], start: date, end: date, title: st
             continue
         day_tasks_sorted = sorted(
             day_tasks,
-            key=lambda t: (_extract_time_from_title(t.get('title') or '')[0] or "99:99")
+            key=lambda t: (_extract_time_from_title(t.get('title') or "")[0] or "99:99")
         )
         first = True
         for t in day_tasks_sorted:
             hhmm, cleaned_title = _extract_time_from_title(t.get("title") or "")
-            cleaned_title = _shorten(cleaned_title, max_title_len)
             time_str = hhmm or "--"
+            title_str = _truncate(html_escape(cleaned_title), max_title_len)
             if first:
-                lines.append(f"{day:8} {wd:3} {time_str:5}  {html_escape(cleaned_title)}")
+                lines.append(f"{day:8} {wd:3} {time_str:5}  {title_str}")
                 first = False
             else:
-                lines.append(f"{'':8} {'':3} {time_str:5}  {html_escape(cleaned_title)}")
+                lines.append(f"{'':8} {'':3} {time_str:5}  {title_str}")
     lines.append("</pre>")
     return "\n".join(lines)
+
+def _format_plain_for_day(tasks: list[dict], day: date) -> str:
+    """Простой (НЕ моно) список для ежедневных напоминаний."""
+    header = f"📅 Стримы сегодня — {day.strftime('%d.%m.%Y')}"
+    if not tasks:
+        return header + "\n\nСегодня стримов нет."
+    # сортировка
+    tasks_sorted = sorted(
+        tasks,
+        key=lambda t: (_extract_time_from_title(t.get('title') or "")[0] or "99:99")
+    )
+    lines = [header, ""]
+    for t in tasks_sorted:
+        hhmm, title = _extract_time_from_title(t.get("title") or "")
+        if hhmm:
+            lines.append(f"• {hhmm} — {html_escape(title)}")
+        else:
+            lines.append(f"• {html_escape(title)}")
+    lines.append("\nЗалетай на стримчики! 😉")
+    return "\n".join(lines)
+
+# ==================== ОТПРАВКА ====================
+async def _send_photo_or_fallback(app: Application, chat_id: str, text: str, kb: InlineKeyboardMarkup | None, photo_url: str):
+    """Сначала как фото-баннер, если не удалось — как текст со ссылкой (превью включено)."""
+    try:
+        await app.bot.send_photo(chat_id=chat_id, photo=photo_url, caption=text, parse_mode="HTML", reply_markup=kb)
+        return
+    except BadRequest as e:
+        print(f"[TG] photo send failed for {chat_id}: {e}. Fallback to link+message.")
+    except Exception as e:
+        print(f"[TG] photo send error to {chat_id}: {e}. Fallback to link+message.")
+    try:
+        await app.bot.send_message(chat_id=chat_id, text=f"{photo_url}\n\n{text}", parse_mode="HTML",
+                                   reply_markup=kb, disable_web_page_preview=False)
+    except Exception as e:
+        print(f"[TG] message send error to {chat_id}: {e}")
+
+async def post_start_stream(app: Application, title: str, youtube_video_id: str | None, photo_url: str | None):
+    """Пост в STREAM_CHAT_IDS о старте стрима."""
+    text = (
+        "🔴 <b>Стрим начался! Забегай, я тебя жду :)</b>\n\n"
+        f"<b>{html_escape(title or 'Стрим')}</b>\n\n"
+        "#DEKTRIAN #D13 #ОНЛАЙН"
+    )
+    kb = _start_stream_kb(youtube_video_id)
+    for chat_id in STREAM_CHAT_IDS:
+        await _send_photo_or_fallback(app, chat_id, text, kb, photo_url or STATIC_IMAGE_URL)
+
+async def post_live_ping(app: Application, youtube_video_id: str | None):
+    """Короткий пост «мы всё ещё в эфире» в STREAM_CHAT_IDS."""
+    text = "Мы всё ещё на стриме, врывайся! 😏"
+    kb = _short_stream_kb(youtube_video_id)
+    for chat_id in STREAM_CHAT_IDS:
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            print(f"[TG] live ping send error to {chat_id}: {e}")
+
+async def post_schedule_reminder(app: Application, text: str, image_url: str | None):
+    """Ежедневные напоминания (только кнопка «вступить в клан», без моно)."""
+    kb = _schedule_only_clan_kb()
+    for chat_id in SCHEDULE_CHAT_IDS:
+        await _send_photo_or_fallback(app, chat_id, text, kb, image_url or SCHEDULE_IMAGE_URL)
 
 # ==================== YOUTUBE ====================
 def _yt_fetch_live_once() -> dict | None:
@@ -325,7 +394,6 @@ def _yt_fetch_live_once() -> dict | None:
             return None
         video_id = items[0]["id"]["videoId"]
         yt_title = items[0]["snippet"].get("title") or "LIVE on YouTube"
-
         r2 = requests.get(
             "https://www.googleapis.com/youtube/v3/videos",
             params={"part": "snippet", "id": video_id, "key": YT_API_KEY, "maxResults": 1},
@@ -341,6 +409,13 @@ def _yt_fetch_live_once() -> dict | None:
                     thumb_url = thumbs[k]["url"]
                     break
         return {"id": video_id, "title": yt_title, "thumb": thumb_url}
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", "?")
+        try:
+            body = e.response.json()
+        except Exception:
+            body = getattr(e.response, "text", "")
+        print(f"[YT] HTTP {code}: {body}")
     except Exception as e:
         print(f"[YT] error: {e}")
     return None
@@ -371,153 +446,164 @@ def _tw_fetch_token() -> str | None:
         _tw_token = data["access_token"]
         _tw_token_expire_at = now_ts + int(data.get("expires_in", 3600))
         return _tw_token
+    except requests.HTTPError as e:
+        print(f"[TW] token HTTP {getattr(e.response, 'status_code', '?')}: {getattr(e.response, 'text', '')}")
+        _tw_token = None
+        _tw_token_expire_at = 0
     except Exception as e:
         print(f"[TW] token error: {e}")
         _tw_token = None
         _tw_token_expire_at = 0
     return None
 
-def _twitch_call_streams(token: str) -> dict | None:
-    r = requests.get(
-        "https://api.twitch.tv/helix/streams",
-        params={"user_login": TWITCH_USERNAME},
-        headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"},
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    return data[0] if data else None
-
-def twitch_check_live_new() -> dict | None:
-    """
-    Возвращает {'id','title'} только если обнаружен НОВЫЙ стрим (сменился stream_id).
-    """
+def twitch_check_live() -> dict | None:
+    """Возвращает {'id': stream_id, 'title': title} если эфир ЛАЙВ, иначе None.
+       ВАЖНО: мы считаем «новым стартом» только изменение stream_id."""
     global last_twitch_stream_id
     if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and TWITCH_USERNAME):
         return None
+
     tk = _tw_fetch_token()
     if not tk:
         return None
-    try:
-        s = _twitch_call_streams(tk)
-        if not s:
+
+    def _call() -> dict | None:
+        r = requests.get(
+            "https://api.twitch.tv/helix/streams",
+            params={"user_login": TWITCH_USERNAME},
+            headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {tk}"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        if not data:
             return None
+        s = data[0]
         sid = s.get("id")
         title = s.get("title")
+        # Если новый stream_id — считаем это свежим стартом
         if sid and sid != last_twitch_stream_id:
             return {"id": sid, "title": title}
         return None
+
+    try:
+        res = _call()
+        if res:
+            last_twitch_stream_id = res["id"]
+        return res
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
+            print(f"[TW] streams HTTP {e.response.status_code}: retry with fresh token")
+            # сброс токена и одна повторная попытка
+            global _tw_token, _tw_token_expire_at
             _tw_token = None
             _tw_token_expire_at = 0
+            tk2 = _tw_fetch_token()
+            if tk2:
+                try:
+                    res = _call()
+                    if res:
+                        last_twitch_stream_id = res["id"]
+                    return res
+                except Exception as e2:
+                    print(f"[TW] retry failed: {e2}")
+                    return None
+        code = getattr(e.response, "status_code", "?")
+        body = getattr(e.response, "text", "")
+        print(f"[TW] streams HTTP {code}: {body}")
     except Exception as e:
-        print(f"[TW] check_new error: {e}")
+        print(f"[TW] error: {e}")
     return None
 
-def twitch_is_live_now() -> bool:
-    """True если сейчас эфир есть (не важно, новый или нет)."""
-    if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and TWITCH_USERNAME):
-        return False
-    tk = _tw_fetch_token()
-    if not tk:
-        return False
+# ==================== ЛОГИКА СТАРТА + ПИНГОВ ЛАЙВА ====================
+async def _announce_with_sources(app: Application, forced_title: str | None = None):
+    """Формирование поста о старте: пытаемся взять превью с YouTube, иначе — статика."""
+    yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
+    title = forced_title or (yt_live.get("title") if yt_live else "Стрим")
+    yt_id = yt_live["id"] if yt_live else None
+    photo_url = (yt_live.get("thumb") if (yt_live and yt_live.get("thumb")) else STATIC_IMAGE_URL)
+    await post_start_stream(app, title, yt_id, photo_url)
+    return yt_id  # пригодится для «мы всё ещё в эфире»
+
+async def _live_ping_loop(app: Application, initial_yt_id: str | None):
+    """Периодические «мы всё ещё в эфире» — раз в час до конца эфира/лимита."""
     try:
-        s = _twitch_call_streams(tk)
-        return bool(s)
+        yt_id = initial_yt_id
+        for _ in range(LIVE_PING_MAX_HOURS):
+            await asyncio.sleep(LIVE_PING_EVERY_MINUTES * 60)
+            # Проверим, эфир ещё идёт?
+            live_now = twitch_check_live()
+            if not live_now:
+                break
+            # Раз в час можно попробовать уточнить YouTube id (может появиться позже)
+            if not yt_id:
+                res = await yt_fetch_live_with_retries(max_attempts=1, delay_seconds=1)
+                yt_id = (res or {}).get("id")
+            await post_live_ping(app, yt_id)
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
-        print(f"[TW] is_live error: {e}")
-        return False
-
-# ==================== ОСНОВНАЯ ЛОГИКА ====================
-async def _announce_with_sources(app: Application, title: str, yt_video: dict | None):
-    yt_id = yt_video["id"] if yt_video else None
-    photo_url = (yt_video.get("thumb") if (yt_video and yt_video.get("thumb")) else SCHEDULE_IMAGE_URL)
-    text = (
-        "🔴 <b>Стрим начался! Забегай, я тебя жду :)</b>\n\n"
-        f"<b>{html_escape(title or '')}</b>\n\n"
-        "#DEKTRIAN #D13 #ОНЛАЙН"
-    )
-    kb = build_keyboard(yt_id)
-    await tg_broadcast_photo_first(app, text, kb, photo_url, STREAM_CHAT_IDS)
-
-async def _live_pulse_loop(app: Application, stream_id: str):
-    """Раз в LIVE_PULSE_MINUTES постим «Мы всё ещё на стриме…», пока эфир жив и id совпадает."""
-    global _live_pulse_task
-    print(f"[PULSE] started for stream {stream_id}")
-    try:
-        while last_twitch_stream_id == stream_id:
-            await asyncio.sleep(LIVE_PULSE_MINUTES * 60)
-            if last_twitch_stream_id != stream_id:
-                break
-            if not twitch_is_live_now():
-                break
-
-            # Кнопки только YouTube/Twitch
-            yt_live = await yt_fetch_live_with_retries(max_attempts=1, delay_seconds=2)
-            yt_url = f"https://www.youtube.com/watch?v={yt_live['id']}" if yt_live else _yt_channel_url()
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("❤️ YouTube", url=yt_url),
-                 InlineKeyboardButton("💜 Twitch", url=f"https://www.twitch.tv/{TWITCH_USERNAME}")]
-            ])
-            await tg_broadcast_message(app, LIVE_PULSE_TEXT, kb, STREAM_CHAT_IDS)
-        print(f"[PULSE] stopped for stream {stream_id}")
-    finally:
-        _live_pulse_task = None
+        print(f"[LIVE PING] loop error: {e}")
 
 async def minute_loop(app: Application):
-    """
-    Каждую минуту:
-      - проверяем новый старт стрима → анонс + запуск почасового пульса;
-      - отслеживаем завершение → стоп пульса.
-    """
-    global last_twitch_stream_id, _live_pulse_task
+    """Каждую минуту проверяем Twitch. Если старт — постим и запускаем пинги."""
+    global _live_ping_task
     print(f"[WAKE] minute loop started at {now_local().isoformat()}")
     while True:
         try:
             if _sec_since(_last_called_ts["tw"]) >= 60:
-                # 1) Новый старт?
-                new_live = twitch_check_live_new()
-                if new_live:
-                    last_twitch_stream_id = new_live["id"]
-                    yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
-                    title = new_live.get("title") or (yt_live.get("title") if yt_live else "Стрим")
-                    await _announce_with_sources(app, title, yt_live)
-
-                    # Запуск пульса
-                    if _live_pulse_task and not _live_pulse_task.done():
-                        _live_pulse_task.cancel()
-                    _live_pulse_task = asyncio.create_task(_live_pulse_loop(app, last_twitch_stream_id))
-
-                # 2) Стрим завершился?
-                if last_twitch_stream_id and (not twitch_is_live_now()):
-                    print("[WAKE] stream ended — stop pulse")
-                    last_twitch_stream_id = None
-                    if _live_pulse_task and not _live_pulse_task.done():
-                        _live_pulse_task.cancel()
-                        _live_pulse_task = None
-
+                print("[WAKE] tick: twitch check")
+                tw = twitch_check_live()
+                if tw:
+                    yt_id = await _announce_with_sources(app, forced_title=tw.get("title") or None)
+                    # стартуем пинги, если ещё не идут
+                    if _live_ping_task is None or _live_ping_task.done():
+                        _live_ping_task = asyncio.create_task(_live_ping_loop(app, yt_id))
                 _last_called_ts["tw"] = int(time.time())
         except Exception as e:
             print(f"[WAKE] loop error: {e}")
         await asyncio.sleep(5)
 
-async def self_ping():
-    if not PUBLIC_URL:
-        print("[SELF-PING] skipped: PUBLIC_URL is empty")
-        return
-    print(f"[SELF-PING] started; target={PUBLIC_URL}/_wake")
+# ==================== ЕЖЕДНЕВНЫЕ НАПОМИНАНИЯ ====================
+_daily_posted: dict[str, set[str]] = {}  # key=date_str 'YYYY-MM-DD' -> set{"HH:MM"}
+
+def _should_post_now(now: datetime, hhmm: str) -> bool:
+    return now.strftime("%H:%M") == hhmm
+
+async def _daily_reminder_tick(app: Application):
+    """Проверяем каждые ~20 сек, наступило ли одно из заданных SCHEDULE_POST_TIMES.
+       Постим ТОЛЬКО если на сегодня есть задачи в Google Tasks."""
+    print("[REMINDER] daily reminder tick started")
     while True:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{PUBLIC_URL}/_wake", timeout=10) as resp:
-                    _ = await resp.text()
-                    print(f"[SELF-PING] status={resp.status}")
-        except Exception as e:
-            print(f"[SELF-PING] error: {e}")
-        await asyncio.sleep(600)
+            now = now_local()
+            day_key = now.strftime("%Y-%m-%d")
+            posted_set = _daily_posted.setdefault(day_key, set())
 
-# ==================== /today /week /month ====================
+            # Сброс трекера по новому дню
+            for k in list(_daily_posted.keys()):
+                if k != day_key:
+                    _daily_posted.pop(k, None)
+
+            for hhmm in SCHEDULE_POST_TIMES:
+                if hhmm in posted_set:
+                    continue
+                if _should_post_now(now, hhmm):
+                    # Собираем задачи на сегодня
+                    tasks = _tasks_fetch_all()
+                    today = now.date()
+                    todays = [t for t in tasks if _due_to_local_date(t.get("due") or "") == today]
+                    if todays:
+                        text = _format_plain_for_day(todays, today)  # НЕ моно, без лишних кнопок
+                        await post_schedule_reminder(app, text, SCHEDULE_IMAGE_URL)
+                        posted_set.add(hhmm)
+                    else:
+                        print(f"[REMINDER] {hhmm}: пропускаем — на сегодня нет задач")
+        except Exception as e:
+            print(f"[REMINDER] tick error: {e}")
+        await asyncio.sleep(20)
+
+# ==================== КОМАНДЫ (Tasks) ====================
 async def _ensure_tasks_env(update: Update) -> bool:
     if not (GOOGLE_TASKS_CLIENT_ID and GOOGLE_TASKS_CLIENT_SECRET and GOOGLE_TASKS_REFRESH_TOKEN and GOOGLE_TASKS_LIST_ID):
         if update.effective_message:
@@ -534,6 +620,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tasks = _tasks_fetch_all()
     d = now_local().date()
+    # Для СЕГОДНЯ — жёстче урежем длину, чтобы не было переноса
     text = _format_table_for_range(tasks, d, d, f"📅 Сегодня — {d.strftime('%d.%m.%Y')}", max_title_len=28)
     if update.effective_message:
         await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=main_reply_kb())
@@ -606,71 +693,36 @@ async def on_month_nav(query_data: str, query, context: ContextTypes.DEFAULT_TYP
     except BadRequest:
         await query.edit_message_reply_markup(reply_markup=kb)
 
-# ==================== МЕНЮ ====================
+# ==================== МЕНЮ/НАВИГАЦИЯ ====================
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_message:
-        await update.effective_message.reply_text("Меню бота:", reply_markup=main_menu_kb())
+        await update.effective_message.reply_text("Меню бота:", reply_markup=_main_menu_kb())
 
 async def on_menu_nav(query_data: str, query, context: ContextTypes.DEFAULT_TYPE):
     if query_data == "menu|socials":
-        await query.edit_message_text("Соцсети стримера:", reply_markup=socials_kb_two_cols())
+        await query.edit_message_text("Соцсети стримера:", reply_markup=_socials_kb())
     elif query_data == "menu|main":
-        await query.edit_message_text("Меню бота:", reply_markup=main_menu_kb())
+        await query.edit_message_text("Меню бота:", reply_markup=_main_menu_kb())
 
-# ==================== ТЕСТ (имитация старта стрима) ====================
+# ==================== КОМАНДА TEST1 ====================
 async def cmd_test1(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Имитируем «стрим начался»: берём YouTube-превью (или fallback), постим анонс."""
+    """Имитирует старт стрима:
+       - берём превью с YouTube (3 попытки), иначе статичная картинка
+       - постим «стрим начался» в STREAM_CHAT_IDS
+       - запускаем часовые «мы ещё в эфире» (как при настоящем старте)"""
     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
-    title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
-    await _announce_with_sources(context.application, title, yt_live)
+    yt_id = (yt_live or {}).get("id")
+    title = (yt_live or {}).get("title") or f"Тестовый пост от {BOT_NAME}"
+    photo = (yt_live or {}).get("thumb") or STATIC_IMAGE_URL
+    await post_start_stream(context.application, title, yt_id, photo)
+
+    # Поднимем имитацию пингов
+    global _live_ping_task
+    if _live_ping_task is None or _live_ping_task.done():
+        _live_ping_task = asyncio.create_task(_live_ping_loop(context.application, yt_id))
+
     if update.effective_message:
-        await update.effective_message.reply_text("Тест: отправил анонс.", reply_markup=main_reply_kb())
-
-# ==================== РАСПИСАНИЕ: ежедневные напоминания ====================
-def _today_tasks(tasks: list[dict]) -> list[dict]:
-    d = now_local().date()
-    m = _tasks_by_date_map(tasks)
-    return m.get(d, [])
-
-async def _daily_reminder_tick(app: Application):
-    """
-    Каждую минуту проверяем времена из DAILY_REMIND_TIMES.
-    Если есть задачи на сегодня — шлём красивый пост (с картинкой), иначе пропускаем.
-    """
-    global _reminder_fired
-    while True:
-        try:
-            now = now_local()
-            hhmm = now.strftime("%H:%M")
-            key = f"{now.date().isoformat()}|{hhmm}"
-            if hhmm in DAILY_REMIND_TIMES and key not in _reminder_fired:
-                tasks = _tasks_fetch_all()
-                today_list = _today_tasks(tasks)
-                if today_list:  # только если есть что постить
-                    # текст без моно, только кнопка «Вступить в клан»
-                    # соберём краткий список
-                    lines = ["<b>Стримы сегодня:</b>"]
-                    # отсортируем по времени из заголовка
-                    today_list.sort(key=lambda t: (_extract_time_from_title(t.get('title') or '')[0] or "99:99"))
-                    for t in today_list:
-                        hhmm, cleaned = _extract_time_from_title(t.get("title") or "")
-                        if hhmm:
-                            lines.append(f"• {hhmm} — {html_escape(cleaned)}")
-                        else:
-                            lines.append(f"• {html_escape(cleaned)}")
-                    lines.append("")
-                    lines.append("Залетай на стримчики! 🔥")
-                    text = "\n".join(lines)
-
-                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🤙 Вступить в клан", url="https://t.me/D13_join_bot")]])
-                    await tg_broadcast_photo_first(app, text, kb, SCHEDULE_IMAGE_URL, SCHEDULE_CHAT_IDS)
-                else:
-                    print(f"[REMIND] {hhmm}: нет стримов — пост пропущен")
-                _reminder_fired.add(key)
-            # очистка старых ключей раз в сутки не обязательна, set небольшой
-        except Exception as e:
-            print(f"[REMIND] tick error: {e}")
-        await asyncio.sleep(30)
+        await update.effective_message.reply_text("Тест1: отправил анонс и запустил часовые пинги.", reply_markup=main_reply_kb())
 
 # ==================== ERROR-HANDLER ====================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -685,29 +737,31 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== STARTUP ====================
 async def _on_start(app: Application):
-    # Видимые slash-команды (латиница). /test1 намеренно НЕ публикуем.
+    # 1) Видимые slash-команды (латиница). /test1 намеренно НЕ публикуем.
     await app.bot.set_my_commands([
         BotCommand("today", "📅 Стримы сегодня"),
-        BotCommand("week", "🗓 Стримы на неделю"),
+        BotCommand("week",  "🗓 Стримы на неделю"),
         BotCommand("month", "📆 Стримы за месяц (по неделям)"),
-        BotCommand("menu", "Открыть меню"),
+        BotCommand("menu",  "Открыть меню"),
     ])
 
-    # Покажем клавиатуру в целевых чатах (по твоей просьбе — оставляем как есть)
-    for chat_id in (set(STREAM_CHAT_IDS) | set(SCHEDULE_CHAT_IDS)):
+    # 2) Показать закреплённую клавиатуру в целевых чатах (по твоей просьбе — оставляем)
+    all_chats = set(STREAM_CHAT_IDS) | set(SCHEDULE_CHAT_IDS)
+    for chat_id in all_chats:
         try:
-            await app.bot.send_message(chat_id=chat_id, text="Меню бота:", reply_markup=main_menu_kb())
+            await app.bot.send_message(chat_id=chat_id, text="Меню бота:", reply_markup=main_reply_kb())
         except Exception as e:
-            print(f"[STARTED] cannot show menu in {chat_id}: {e}")
+            print(f"[STARTED] cannot show keyboard in {chat_id}: {e}")
 
-    # Фоновые задачи
-    asyncio.create_task(minute_loop(app))
-    asyncio.create_task(self_ping()))
-    asyncio.create_task(_daily_reminder_tick(app))
+    # 3) Фоновые задачи
+    asyncio.create_task(minute_loop(app))          # детект старта стрима
+    asyncio.create_task(self_ping())               # поддержка живости хоста
+    asyncio.create_task(_daily_reminder_tick(app)) # ежедневные напоминания
 
     print(f"[STARTED] {BOT_NAME} at {now_local().isoformat()}")
 
 # ==================== ROUTING ====================
+# Обработка «ReplyKeyboard» — реагируем ТОЛЬКО на точное совпадение с нашими кнопками.
 async def on_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message or not update.effective_message.text:
         return
@@ -726,14 +780,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     q = update.callback_query
     data = q.data or ""
-    await q.answer()
-    if data.startswith("m|"):
+    await q.answer()  # ack
+    if data.startswith("m|"):         # навигация по неделям месяца
         await on_month_nav(data, q, context)
-    elif data.startswith("menu|"):
+    elif data.startswith("menu|"):    # инлайн меню
         await on_menu_nav(data, q, context)
-    elif data.startswith("t|"):
+    elif data.startswith("t|"):       # быстрые кнопки t|today|week|month
         action = data.split("|", 1)[1]
-        dummy_update = Update(update.update_id, message=q.message)
+        dummy_update = Update(update.update_id, message=q.message)  # переиспользуем message
         if action == "today":
             await cmd_today(dummy_update, context)
         elif action == "week":
@@ -741,12 +795,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "month":
             await cmd_month(dummy_update, context)
 
-def main():
-    if not TG_TOKEN or not (STREAM_CHAT_IDS or SCHEDULE_CHAT_IDS):
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN and at least one chat id in code or env")
-
+# Self-ping для бесплатного хоста
+async def self_ping():
     if not PUBLIC_URL:
-        raise SystemExit("Set PUBLIC_URL (https://<your-host>) for webhook (или RENDER_EXTERNAL_URL)")
+        print("[SELF-PING] skipped: PUBLIC_URL is empty")
+        return
+    print(f"[SELF-PING] started; target={PUBLIC_URL}/_wake")
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{PUBLIC_URL}/_wake", timeout=10) as resp:
+                    _ = await resp.text()
+                    print(f"[SELF-PING] status={resp.status}")
+        except Exception as e:
+            print(f"[SELF-PING] error: {e}")
+        await asyncio.sleep(600)
+
+def main():
+    if not TG_TOKEN:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN in Environment")
+    if not PUBLIC_URL:
+        raise SystemExit("Set PUBLIC_URL (https://<your-host>) for webhook (или используйте RENDER_EXTERNAL_URL)")
 
     application = (
         Application.builder()
@@ -755,21 +824,22 @@ def main():
         .build()
     )
 
-    # Slash-команды
-    application.add_handler(CommandHandler("test1", cmd_test1))  # скрытая команда
+    # Команды
+    application.add_handler(CommandHandler("test1", cmd_test1))   # скрытая команда для тебя
     application.add_handler(CommandHandler("today", cmd_today))
-    application.add_handler(CommandHandler("week", cmd_week))
+    application.add_handler(CommandHandler("week",  cmd_week))
     application.add_handler(CommandHandler("month", cmd_month))
-    application.add_handler(CommandHandler("menu", cmd_menu))
+    application.add_handler(CommandHandler("menu",  cmd_menu))
 
-    # Текстовые кнопки (строгое совпадение)
+    # Текстовые кнопки (ReplyKeyboard) — только точные совпадения
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_buttons))
 
-    # Callback-кнопки
+    # Callback-кнопки (InlineKeyboard)
     application.add_handler(CallbackQueryHandler(on_callback))
 
     application.add_error_handler(on_error)
 
+    # Вебхук
     webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
     print(f"[WEBHOOK] listen 0.0.0.0:{PORT}  path={WEBHOOK_PATH}  url={webhook_url}")
 
