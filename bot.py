@@ -90,7 +90,7 @@ _tw_token: str | None = None
 _tw_token_expire_at: int = 0  # unix ts
 _last_called_ts = {"tw": 0}
 
-# Секретный state: якорные сообщения, чтобы чат был чистым
+# Якорные сообщения
 LAST_ANCHOR: dict[int, int] = {}  # chat_id -> message_id
 
 # Флаг текущего эфира + таск почасовых пингов
@@ -119,15 +119,6 @@ async def _delete_if_possible(bot, chat_id: int, message_id: int):
     except Exception:
         pass
 
-async def _replace_anchor(app: Application, chat_id: int, text: str, kb: InlineKeyboardMarkup | None, parse_mode: str = "HTML"):
-    """Чистим предыдущий якорь и публикуем новый; возвращаем message_id."""
-    old_id = LAST_ANCHOR.get(chat_id)
-    if old_id:
-        await _delete_if_possible(app.bot, chat_id, old_id)
-    msg = await app.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=kb, disable_web_page_preview=False)
-    LAST_ANCHOR[chat_id] = msg.message_id
-    return msg.message_id
-
 async def _delete_user_trigger(update: Update):
     if update and update.effective_message:
         try:
@@ -135,9 +126,27 @@ async def _delete_user_trigger(update: Update):
         except Exception:
             pass
 
+async def _replace_anchor(app: Application, chat_id: int, text: str, kb: InlineKeyboardMarkup | None, parse_mode: str = "HTML"):
+    """
+    Удаляем предыдущий якорь, отправляем новый БЕЗ ЗВУКА, сохраняем его id.
+    """
+    old_id = LAST_ANCHOR.get(chat_id)
+    if old_id:
+        await _delete_if_possible(app.bot, chat_id, old_id)
+    msg = await app.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=kb,
+        disable_web_page_preview=False,
+        disable_notification=True,  # <<< без звука
+    )
+    LAST_ANCHOR[chat_id] = msg.message_id
+    return msg.message_id
+
 
 # ==================== TELEGRAM UI ====================
-# Тексты кнопок ReplyKeyboard (строго по равенству сравниваем)
+# Тексты кнопок ReplyKeyboard (строго по равенству)
 LABEL_TODAY = "📅 Стримы сегодня"
 LABEL_WEEK = "📅 Стримы на неделю"
 LABEL_MONTH = "📅 Стримы за месяц"
@@ -151,7 +160,6 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
 
 def _tabs_kb(selected: str | None = None) -> InlineKeyboardMarkup:
-    # selected — 'today'|'week'|'month' (можно не использовать для визуального выделения)
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📅 Сегодня", callback_data="t|today"),
@@ -166,7 +174,6 @@ def _combine_kb_rows(*markups: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
     for m in markups:
         if not m:
             continue
-        # InlineKeyboardMarkup.to_dict() не нужен — у объекта есть .inline_keyboard
         rows.extend(m.inline_keyboard)
     return InlineKeyboardMarkup(rows)
 
@@ -605,7 +612,7 @@ async def minute_loop(app: Application):
 
 async def _check_reminders(app: Application):
     """
-    В 10:00 и 14:00 по Киеву (REMINDER_TIMES) шлём пост на сегодня,
+    В REMINDER_TIMES по Киеву шлём пост на сегодня,
     только если на сегодня есть стримы. Картинка REMINDER_IMAGE_URL.
     """
     local_now = now_local()
@@ -727,7 +734,7 @@ async def _build_month_text(idx: int | None = 0) -> tuple[str, InlineKeyboardMar
     kb = _combine_kb_rows(nav, _tabs_kb("month"))
     return text, kb
 
-# --- Команды (всегда чистим триггер и меняем якорь) ---
+# --- Команды: удаляем триггер, создаём новый якорь (без звука) ---
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _delete_user_trigger(update)
     chat_id = update.effective_chat.id
@@ -773,6 +780,7 @@ async def cmd_test1(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Обрабатываем только точные нажатия кнопок ReplyKeyboard — никаких подстрок.
+    Каждый такой запрос создаёт новое (тихое) якорное сообщение и удаляет старое.
     """
     if not update.effective_message or not update.effective_message.text:
         return
@@ -816,7 +824,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text, kb = await _build_month_text(idx=0)
                     await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
         except BadRequest:
-            # Если Telegram считает, что «ничего не изменилось», просто обновим клаву
             try:
                 if action == "month":
                     text, kb = await _build_month_text(idx=0)
@@ -868,6 +875,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("Соцсети стримера:", reply_markup=_socials_kb())
             except BadRequest:
                 await q.edit_message_reply_markup(reply_markup=_socials_kb())
+        elif key == "book":
+            try:
+                await q.edit_message_text("Бронь стрима:", reply_markup=_book_kb())
+            except BadRequest:
+                await q.edit_message_reply_markup(reply_markup=_book_kb())
         return
 
     # Бронь
@@ -902,7 +914,7 @@ async def _on_start(app: Application):
         BotCommand("month", "📅 Стримы за месяц"),
         BotCommand("menu", "Открыть меню"),
     ])
-    # Никаких стартовых «Меню бота:» — молчим, пока нас не вызовут.
+    # Никаких стартовых сообщений — молчим, пока нас не вызовут.
     asyncio.create_task(minute_loop(app))
     asyncio.create_task(self_ping())
     print(f"[STARTED] {BOT_NAME} at {now_local().isoformat()}")
@@ -910,7 +922,6 @@ async def _on_start(app: Application):
 
 # ==================== MAIN ====================
 def main():
-    # хотя бы один канал нужен либо в STREAM_POST_CHATS/REMINDER_POST_CHATS, либо в CHAT_IDS_ENV
     if not TG_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in ENV")
     if not (STREAM_POST_CHATS or REMINDER_POST_CHATS or CHAT_IDS_ENV):
