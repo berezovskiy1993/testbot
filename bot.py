@@ -78,7 +78,6 @@ STREAM_POST_CHATS: list[int] = [
 REMINDER_POST_CHATS: list[int] = [
     # Пример: -1009876543210,
 ]
-# Если списки пустые — используем CHAT_IDS_ENV
 def _targets_for_stream_posts() -> list[int]:
     return STREAM_POST_CHATS or CHAT_IDS_ENV
 def _targets_for_reminders() -> list[int]:
@@ -146,17 +145,11 @@ async def _replace_anchor(app: Application, chat_id: int, text: str, kb: InlineK
 
 
 # ==================== TELEGRAM UI ====================
-# Тексты кнопок ReplyKeyboard (строго по равенству)
-LABEL_TODAY = "📅 Стримы сегодня"
-LABEL_WEEK = "📅 Стримы на неделю"
-LABEL_MONTH = "📅 Стримы за месяц"
-LABEL_MENU = "☰ Меню"
+# Единственная широкая кнопка ReplyKeyboard
+LABEL_MENU = "Расписание стримов и прочее"
 
 def main_reply_kb() -> ReplyKeyboardMarkup:
-    rows = [
-        [KeyboardButton(LABEL_TODAY), KeyboardButton(LABEL_WEEK)],
-        [KeyboardButton(LABEL_MONTH), KeyboardButton(LABEL_MENU)],
-    ]
+    rows = [[KeyboardButton(LABEL_MENU)]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
 
 def _tabs_kb(selected: str | None = None) -> InlineKeyboardMarkup:
@@ -635,7 +628,6 @@ async def _check_reminders(app: Application):
         "📢 <b>Стримы сегодня</b>",
         "",
     ]
-    # Сортировка
     def sort_key(t: dict):
         d = _due_to_local_date(t.get("due") or "")
         time_in_title, _ = _extract_time_from_title(t.get("title") or "")
@@ -779,19 +771,13 @@ async def cmd_test1(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== ROUTING ====================
 async def on_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Обрабатываем только точные нажатия кнопок ReplyKeyboard — никаких подстрок.
+    Обрабатываем только точные нажатия единственной кнопки ReplyKeyboard.
     Каждый такой запрос создаёт новое (тихое) якорное сообщение и удаляет старое.
     """
     if not update.effective_message or not update.effective_message.text:
         return
     txt = update.effective_message.text.strip()
-    if txt == LABEL_TODAY:
-        await cmd_today(update, context)
-    elif txt == LABEL_WEEK:
-        await cmd_week(update, context)
-    elif txt == LABEL_MONTH:
-        await cmd_month(update, context)
-    elif txt == LABEL_MENU:
+    if txt == LABEL_MENU:
         await cmd_menu(update, context)
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -943,7 +929,7 @@ def main():
     application.add_handler(CommandHandler("month", cmd_month))
     application.add_handler(CommandHandler("menu", cmd_menu))
 
-    # Текстовые кнопки (ReplyKeyboard) — только точные совпадения
+    # Текстовая ReplyKeyboard: одна широкая кнопка
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_buttons))
 
     # Callback-кнопки (InlineKeyboard)
