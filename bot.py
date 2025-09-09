@@ -956,7 +956,7 @@ async def _on_start(app: Application):
 
     # 3) Фоновые задачи
     asyncio.create_task(minute_loop(app))
-    asyncio.create_task(self_ping()))
+    asyncio.create_task(self_ping())
     asyncio.create_task(_daily_schedule_loop(app))
     print(f"[STARTED] {BOT_NAME} at {now_local().isoformat()}")
 
