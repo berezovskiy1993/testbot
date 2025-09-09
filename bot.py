@@ -57,7 +57,7 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/telegram/{BOT_NAME}")
 # ========= КОНФИГ В КОДЕ (легко править) =========
 # Картинка для анонсов стрима (если нет превью YouTube)
 STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
-# Картинка для дневных напоминаний расписания (легко заменить)
+# Картинка для дневных напоминаний расписания
 SCHEDULE_IMAGE_URL = "https://ibb.co/LXSMV1FQ"
 
 # Где публикуем анонсы старта и ежечасные напоминания (если пусто — берём CHAT_IDS)
@@ -69,7 +69,7 @@ SCHEDULE_REMINDER_CHAT_IDS: List[int | str] = []
 DAILY_SCHEDULE_TIMES = ["10:00", "14:00"]
 
 # Ежечасное «мы всё ещё в эфире»
-LIVE_REMINDER_EVERY_MIN = 60  # период (мин). Меняй при необходимости.
+LIVE_REMINDER_EVERY_MIN = 60  # период (мин)
 
 # Тихие сервисные сообщения (меню/навигация/клавиатура)
 MUTE_SERVICE_MESSAGES = True
@@ -77,6 +77,9 @@ MUTE_SERVICE_MESSAGES = True
 # Текст клавиатурной кнопки (широкая)
 KB_LABEL = "Расписание стримов и прочее"
 KB_LABEL_LOWER = KB_LABEL.lower()
+
+# TTL для персонального меню (минуты)
+MENU_TTL_MIN = 15
 
 # ========= In-memory state =========
 last_twitch_stream_id: Optional[str] = None
@@ -86,6 +89,8 @@ _last_called_ts = {"tw": 0}
 
 # Личное якорное меню: (chat_id, user_id) -> message_id
 _user_menu_anchor: Dict[Tuple[int, int], int] = {}
+# TTL-таски для меню: (chat_id, user_id) -> asyncio.Task
+_menu_ttl_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
 
 # Ежечасные напоминания по лайву
 _live_reminder_task: Optional[asyncio.Task] = None
@@ -224,7 +229,6 @@ def _format_today_plain(tasks: List[dict], d: date) -> str:
     if not tasks:
         return f"{header}\n\nСегодня стримов нет."
     lines = [header, ""]
-    # сортируем по времени в заголовке
     tasks_sorted = sorted(tasks, key=lambda t: (_extract_time_from_title(t.get("title") or "")[0] or "99:99"))
     for t in tasks_sorted:
         hhmm, cleaned_title = _extract_time_from_title(t.get("title") or "")
@@ -437,7 +441,8 @@ def build_announce_kb(youtube_video_id: Optional[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("❤️ Гоу на YouTube", url=yt_url),
          InlineKeyboardButton("💜 Гоу на Twitch",  url=tw_url)],
-        [InlineKeyboardButton("🤙 Вступить в клан", url="https://t.me/D13_join_bot")]
+        [InlineKeyboardButton("💸 Гоу Донатик", url="https://new.donatepay.ru/@Dektrian_TV"),
+         InlineKeyboardButton("🤙 Вступить в клан", url="https://t.me/D13_join_bot")],
     ])
 
 async def tg_broadcast_photo_first(app: Application, chat_ids: List[int | str], text: str,
@@ -488,22 +493,17 @@ async def _live_reminder_loop(app: Application):
     print("[LIVE-REM] loop started")
     try:
         while True:
-            # ждём период
             await asyncio.sleep(max(1, LIVE_REMINDER_EVERY_MIN * 60))
-
-            # Проверяем только Twitch
             if not twitch_is_live():
                 print("[LIVE-REM] offline detected -> stop")
                 break
-
             # Удалим прошлые напоминания
             for chat_id, mid in list(_live_last_msg_by_chat.items()):
                 try:
                     await app.bot.delete_message(chat_id=chat_id, message_id=mid)
                 except Exception:
                     pass
-
-            # Отправляем новое
+            # Новое
             kb = build_watch_kb_for_reminder()
             for chat_id in _ids_or_default(ANNOUNCE_CHAT_IDS):
                 try:
@@ -511,14 +511,12 @@ async def _live_reminder_loop(app: Application):
                         chat_id=chat_id,
                         text="Мы всё ещё на стриме, врывайся! 😏",
                         reply_markup=kb,
-                        disable_notification=False,  # с звуком
+                        disable_notification=False,  # со звуком
                     )
                     _live_last_msg_by_chat[chat_id] = msg.message_id
                 except Exception as e:
                     print(f"[LIVE-REM] send error to {chat_id}: {e}")
-
     finally:
-        # Очистка
         _live_reminder_task = None
         _live_last_msg_by_chat.clear()
         print("[LIVE-REM] loop finished")
@@ -563,7 +561,7 @@ async def _post_today_schedule_if_any(app: Application):
         text,
         kb,
         SCHEDULE_IMAGE_URL,
-        silent=False,  # с звуком
+        silent=False,  # со звуком
     )
 
 # ==================== ЯДРО: «будильник» ====================
@@ -574,6 +572,8 @@ async def minute_loop(app: Application):
             if _sec_since(_last_called_ts["tw"]) >= 60:
                 tw = twitch_check_live()
                 if tw:
+                    # Дадим YouTube время поднять лайв и превью
+                    await asyncio.sleep(10)
                     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
                     title = tw.get("title") or (yt_live.get("title") if yt_live else "Стрим")
                     await _announce_with_sources(app, title, yt_live)
@@ -606,7 +606,7 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📅 Месяц",   callback_data="menu|month"),
          InlineKeyboardButton("Соцсети",    callback_data="menu|socials")],
         [InlineKeyboardButton("Бронь стрима", callback_data="br|main"),
-         InlineKeyboardButton("Купить юси",   callback_data="ext|buyuc")],
+         InlineKeyboardButton("Купить юси",   url="https://t.me/uc_pubg_bounty")],
         [InlineKeyboardButton("Вступить в клан", url="https://t.me/D13_join_bot")],
     ])
 
@@ -699,11 +699,47 @@ async def _render_month_text(idx: int | None = None) -> Tuple[str, InlineKeyboar
     kb = _month_kb(f"{year:04d}-{month:02d}", i, len(weeks))
     return text, kb
 
+# ===== TTL для меню =====
+def _cancel_menu_ttl(anchor_key: Tuple[int, int]):
+    task = _menu_ttl_tasks.pop(anchor_key, None)
+    if task and not task.done():
+        task.cancel()
+
+def _schedule_menu_ttl(app: Application, anchor_key: Tuple[int, int]):
+    _cancel_menu_ttl(anchor_key)
+    async def _ttl():
+        try:
+            await asyncio.sleep(max(1, MENU_TTL_MIN * 60))
+            # удалить сообщение-меню, если ещё существует
+            msg_id = _user_menu_anchor.get(anchor_key)
+            if msg_id:
+                chat_id, user_id = anchor_key
+                try:
+                    await app.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                except Exception:
+                    pass
+                _user_menu_anchor.pop(anchor_key, None)
+        except asyncio.CancelledError:
+            return
+        finally:
+            _menu_ttl_tasks.pop(anchor_key, None)
+    _menu_ttl_tasks[anchor_key] = asyncio.create_task(_ttl())
+
+def _reset_menu_ttl(app: Application, anchor_key: Tuple[int, int]):
+    _schedule_menu_ttl(app, anchor_key)
+
+def _find_owner_by_message(chat_id: int, message_id: int) -> Optional[Tuple[int, int]]:
+    # Вернёт (chat_id, user_id) для владельца меню с этим message_id
+    for (c_id, u_id), mid in _user_menu_anchor.items():
+        if c_id == chat_id and mid == message_id:
+            return (c_id, u_id)
+    return None
+
 async def _show_main_menu_for_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     anchor_key = (chat_id, user_id)
-    # удалим сообщение-триггер (которое прислал пользователь, нажав кнопку клавиатуры)
+    # удалим сообщение-триггер (пользователь нажал кнопку клавиатуры)
     try:
         if update.effective_message:
             await context.bot.delete_message(chat_id=chat_id, message_id=update.effective_message.message_id)
@@ -716,6 +752,7 @@ async def _show_main_menu_for_user(update: Update, context: ContextTypes.DEFAULT
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
                                                 text="Меню бота:", reply_markup=_main_menu_kb())
+            _reset_menu_ttl(context.application, anchor_key)
             return
         except Exception:
             # якорь устарел/удалён — создадим новый
@@ -725,17 +762,21 @@ async def _show_main_menu_for_user(update: Update, context: ContextTypes.DEFAULT
                                              reply_markup=_main_menu_kb(),
                                              disable_notification=MUTE_SERVICE_MESSAGES)
         _user_menu_anchor[anchor_key] = msg.message_id
+        _reset_menu_ttl(context.application, anchor_key)
     except Exception as e:
         print(f"[MENU] send failed: {e}")
 
 # ==================== КОМАНДЫ (включая /test1) ====================
 async def cmd_test1(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Имитирует старт: YouTube превью -> анонс -> (без ежечасного)
+    # Имитирует старт: YouTube превью -> анонс (без ежечасного)
+    # Добавим ту же задержку перед попытками, как в прод-потоке
+    await asyncio.sleep(10)
     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
     title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
     await _announce_with_sources(context.application, title, yt_live)
     if update.effective_message:
-        await update.effective_message.reply_text("✅ Тест: отправил анонс.", disable_notification=MUTE_SERVICE_MESSAGES)
+        await update.effective_message.reply_text("✅ Тест: отправил анонс.",
+                                                  disable_notification=MUTE_SERVICE_MESSAGES)
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _ensure_tasks_env(update):
@@ -781,6 +822,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Редактируем именно то сообщение, из которого нажали кнопку
     chat_id = q.message.chat.id
     msg_id = q.message.message_id
+
+    # продлим TTL меню при любой навигации
+    owner_key = _find_owner_by_message(chat_id, msg_id)
+    if owner_key:
+        _reset_menu_ttl(context.application, owner_key)
 
     if data == "menu|main":
         try:
@@ -836,7 +882,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = int(idx_str)
         except Exception:
             return
-        # Отрисуем по параметрам
         tasks = _tasks_fetch_all()
         weeks = _month_weeks(year, month)
         if not weeks:
@@ -876,13 +921,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"[CB] br terms err: {e}")
         return
 
-    if data == "ext|buyuc":
-        # просто меняем подпись (кнопка сама ведёт по ссылке в главном меню, здесь ничего не делаем)
-        try:
-            await context.bot.answer_callback_query(q.id, "Открываю магазин…", show_alert=False)
-        except Exception:
-            pass
-
 # ==================== ERROR-HANDLER ====================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
@@ -918,7 +956,7 @@ async def _on_start(app: Application):
 
     # 3) Фоновые задачи
     asyncio.create_task(minute_loop(app))
-    asyncio.create_task(self_ping())
+    asyncio.create_task(self_ping()))
     asyncio.create_task(_daily_schedule_loop(app))
     print(f"[STARTED] {BOT_NAME} at {now_local().isoformat()}")
 
