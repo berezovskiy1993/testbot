@@ -54,7 +54,7 @@ PORT = int(os.getenv("PORT", os.getenv("RENDER_PORT", "8080")))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "dektrian-secret")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/telegram/{BOT_NAME}")
 
-# ========= КОНФИГ В КОДЕ (легко править) =========
+# ========= КОНФИГ В КОДЕ =========
 # Картинка для анонсов стрима (если нет превью YouTube)
 STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
 # Картинка для дневных напоминаний расписания
@@ -78,8 +78,8 @@ MUTE_SERVICE_MESSAGES = True
 KB_LABEL = "Расписание стримов и прочее"
 KB_LABEL_LOWER = KB_LABEL.lower()
 
-# TTL для персонального меню (минуты)
-MENU_TTL_MIN = 15
+# TTL меню (сек)
+MENU_TTL_SECONDS = 15 * 60
 
 # ========= In-memory state =========
 last_twitch_stream_id: Optional[str] = None
@@ -89,8 +89,8 @@ _last_called_ts = {"tw": 0}
 
 # Личное якорное меню: (chat_id, user_id) -> message_id
 _user_menu_anchor: Dict[Tuple[int, int], int] = {}
-# TTL-таски для меню: (chat_id, user_id) -> asyncio.Task
-_menu_ttl_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
+# Таймеры на удаление меню: (chat_id, message_id) -> task
+_menu_timers: Dict[Tuple[int, int], asyncio.Task] = {}
 
 # Ежечасные напоминания по лайву
 _live_reminder_task: Optional[asyncio.Task] = None
@@ -319,7 +319,7 @@ async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int =
         if res:
             return res
         if attempt < max_attempts:
-            await asyncio.sleep(delay_seconds)
+            await asyncio.sleep(delay_seconds)  # ← гарантированная пауза 10с между попытками
     return None
 
 # ==================== TWITCH ====================
@@ -442,14 +442,13 @@ def build_announce_kb(youtube_video_id: Optional[str]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("❤️ Гоу на YouTube", url=yt_url),
          InlineKeyboardButton("💜 Гоу на Twitch",  url=tw_url)],
         [InlineKeyboardButton("💸 Гоу Донатик", url="https://new.donatepay.ru/@Dektrian_TV"),
-         InlineKeyboardButton("🤙 Вступить в клан", url="https://t.me/D13_join_bot")],
+         InlineKeyboardButton("🤙 Вступить в клан", url="https://t.me/D13_join_bot")]
     ])
 
 async def tg_broadcast_photo_first(app: Application, chat_ids: List[int | str], text: str,
                                    kb: Optional[InlineKeyboardMarkup], photo_url: str,
                                    silent: bool = False):
     for chat_id in chat_ids:
-        # 1) Пытаемся как фото
         try:
             await app.bot.send_photo(
                 chat_id=chat_id,
@@ -464,7 +463,6 @@ async def tg_broadcast_photo_first(app: Application, chat_ids: List[int | str], 
             print(f"[TG] photo failed for {chat_id}: {e}. Fallback to link.")
         except Exception as e:
             print(f"[TG] photo error to {chat_id}: {e}. Fallback to link.")
-        # 2) Фолбэк: ссылка + текст
         try:
             await app.bot.send_message(
                 chat_id=chat_id,
@@ -497,13 +495,11 @@ async def _live_reminder_loop(app: Application):
             if not twitch_is_live():
                 print("[LIVE-REM] offline detected -> stop")
                 break
-            # Удалим прошлые напоминания
             for chat_id, mid in list(_live_last_msg_by_chat.items()):
                 try:
                     await app.bot.delete_message(chat_id=chat_id, message_id=mid)
                 except Exception:
                     pass
-            # Новое
             kb = build_watch_kb_for_reminder()
             for chat_id in _ids_or_default(ANNOUNCE_CHAT_IDS):
                 try:
@@ -511,7 +507,7 @@ async def _live_reminder_loop(app: Application):
                         chat_id=chat_id,
                         text="Мы всё ещё на стриме, врывайся! 😏",
                         reply_markup=kb,
-                        disable_notification=False,  # со звуком
+                        disable_notification=False,
                     )
                     _live_last_msg_by_chat[chat_id] = msg.message_id
                 except Exception as e:
@@ -551,17 +547,15 @@ async def _post_today_schedule_if_any(app: Application):
     if not todays:
         print("[DAILY] no streams today -> skip")
         return
-
     text = _format_today_plain(todays, today)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🤙 Вступить в клан", url="https://t.me/D13_join_bot")]])
-
     await tg_broadcast_photo_first(
         app,
         _ids_or_default(SCHEDULE_REMINDER_CHAT_IDS),
         text,
         kb,
         SCHEDULE_IMAGE_URL,
-        silent=False,  # со звуком
+        silent=False,
     )
 
 # ==================== ЯДРО: «будильник» ====================
@@ -572,8 +566,6 @@ async def minute_loop(app: Application):
             if _sec_since(_last_called_ts["tw"]) >= 60:
                 tw = twitch_check_live()
                 if tw:
-                    # Дадим YouTube время поднять лайв и превью
-                    await asyncio.sleep(10)
                     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
                     title = tw.get("title") or (yt_live.get("title") if yt_live else "Стрим")
                     await _announce_with_sources(app, title, yt_live)
@@ -663,6 +655,43 @@ def _month_kb(ym: str, idx: int, total: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("← Меню", callback_data="menu|main")]
     ])
 
+# ==================== TTL МЕНЮ ====================
+def _cancel_menu_timer(chat_id: int, message_id: int):
+    key = (chat_id, message_id)
+    task = _menu_timers.pop(key, None)
+    if task and not task.done():
+        task.cancel()
+
+def _find_anchor_key_by_message(chat_id: int, message_id: int) -> Optional[Tuple[int, int]]:
+    for (c, u), mid in list(_user_menu_anchor.items()):
+        if c == chat_id and mid == message_id:
+            return (c, u)
+    return None
+
+async def _menu_ttl_worker(chat_id: int, message_id: int):
+    try:
+        await asyncio.sleep(MENU_TTL_SECONDS)
+        # Стараемся удалить ровно это меню
+        try:
+            await app_global.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+        # Чистим якорь, если соответствовал
+        ak = _find_anchor_key_by_message(chat_id, message_id)
+        if ak:
+            _user_menu_anchor.pop(ak, None)
+    finally:
+        _menu_timers.pop((chat_id, message_id), None)
+
+def _arm_menu_ttl(chat_id: int, message_id: int):
+    _cancel_menu_timer(chat_id, message_id)
+    task = asyncio.create_task(_menu_ttl_worker(chat_id, message_id))
+    _menu_timers[(chat_id, message_id)] = task
+
+def _extend_menu_ttl(chat_id: int, message_id: int):
+    _arm_menu_ttl(chat_id, message_id)
+
+# ==================== РЕНДЕРЫ ТЕКСТОВ РАСПИСАНИЯ ====================
 async def _ensure_tasks_env(update: Optional[Update]) -> bool:
     if not (GOOGLE_TASKS_CLIENT_ID and GOOGLE_TASKS_CLIENT_SECRET and GOOGLE_TASKS_REFRESH_TOKEN and GOOGLE_TASKS_LIST_ID):
         if update and update.effective_message:
@@ -685,7 +714,7 @@ async def _render_week_text() -> str:
     tasks = _tasks_fetch_all()
     start = now_local().date()
     end = start + timedelta(days=6)
-    return _format_table_for_range(tasks, start, end, f"🗓 Неделя — {start.strftime('%d.%m')}–{end.strftime('%d.%m')}")
+    return _format_table_for_range(tasks, start, end, f"🗓 Неделя — {start.strftime('%d.%м')}–{end.strftime('%d.%m')}")
 
 async def _render_month_text(idx: int | None = None) -> Tuple[str, InlineKeyboardMarkup]:
     tasks = _tasks_fetch_all()
@@ -699,84 +728,46 @@ async def _render_month_text(idx: int | None = None) -> Tuple[str, InlineKeyboar
     kb = _month_kb(f"{year:04d}-{month:02d}", i, len(weeks))
     return text, kb
 
-# ===== TTL для меню =====
-def _cancel_menu_ttl(anchor_key: Tuple[int, int]):
-    task = _menu_ttl_tasks.pop(anchor_key, None)
-    if task and not task.done():
-        task.cancel()
-
-def _schedule_menu_ttl(app: Application, anchor_key: Tuple[int, int]):
-    _cancel_menu_ttl(anchor_key)
-    async def _ttl():
-        try:
-            await asyncio.sleep(max(1, MENU_TTL_MIN * 60))
-            # удалить сообщение-меню, если ещё существует
-            msg_id = _user_menu_anchor.get(anchor_key)
-            if msg_id:
-                chat_id, user_id = anchor_key
-                try:
-                    await app.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                except Exception:
-                    pass
-                _user_menu_anchor.pop(anchor_key, None)
-        except asyncio.CancelledError:
-            return
-        finally:
-            _menu_ttl_tasks.pop(anchor_key, None)
-    _menu_ttl_tasks[anchor_key] = asyncio.create_task(_ttl())
-
-def _reset_menu_ttl(app: Application, anchor_key: Tuple[int, int]):
-    _schedule_menu_ttl(app, anchor_key)
-
-def _find_owner_by_message(chat_id: int, message_id: int) -> Optional[Tuple[int, int]]:
-    # Вернёт (chat_id, user_id) для владельца меню с этим message_id
-    for (c_id, u_id), mid in _user_menu_anchor.items():
-        if c_id == chat_id and mid == message_id:
-            return (c_id, u_id)
-    return None
-
+# ==================== ПОКАЗ МЕНЮ (персональный, с удалением старого) ====================
 async def _show_main_menu_for_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     anchor_key = (chat_id, user_id)
-    # удалим сообщение-триггер (пользователь нажал кнопку клавиатуры)
+
+    # 1) удаляем сообщение-триггер пользователя (из клавиатуры) — чтобы не плодить служебку
     try:
         if update.effective_message:
             await context.bot.delete_message(chat_id=chat_id, message_id=update.effective_message.message_id)
     except Exception:
         pass
 
-    # отправляем/редактируем личное якорное меню
-    msg_id = _user_menu_anchor.get(anchor_key)
-    if msg_id:
+    # 2) если у этого пользователя уже было меню — удалим его и таймер
+    old_msg_id = _user_menu_anchor.get(anchor_key)
+    if old_msg_id:
+        _cancel_menu_timer(chat_id, old_msg_id)
         try:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
-                                                text="Меню бота:", reply_markup=_main_menu_kb())
-            _reset_menu_ttl(context.application, anchor_key)
-            return
+            await context.bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
         except Exception:
-            # якорь устарел/удалён — создадим новый
             pass
+        _user_menu_anchor.pop(anchor_key, None)
+
+    # 3) создаём новое личное меню (без звука)
     try:
         msg = await context.bot.send_message(chat_id=chat_id, text="Меню бота:",
                                              reply_markup=_main_menu_kb(),
                                              disable_notification=MUTE_SERVICE_MESSAGES)
         _user_menu_anchor[anchor_key] = msg.message_id
-        _reset_menu_ttl(context.application, anchor_key)
+        _arm_menu_ttl(chat_id, msg.message_id)
     except Exception as e:
         print(f"[MENU] send failed: {e}")
 
 # ==================== КОМАНДЫ (включая /test1) ====================
 async def cmd_test1(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Имитирует старт: YouTube превью -> анонс (без ежечасного)
-    # Добавим ту же задержку перед попытками, как в прод-потоке
-    await asyncio.sleep(10)
     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
     title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
     await _announce_with_sources(context.application, title, yt_live)
     if update.effective_message:
-        await update.effective_message.reply_text("✅ Тест: отправил анонс.",
-                                                  disable_notification=MUTE_SERVICE_MESSAGES)
+        await update.effective_message.reply_text("✅ Тест: отправил анонс.", disable_notification=MUTE_SERVICE_MESSAGES)
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _ensure_tasks_env(update):
@@ -801,7 +792,6 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                   disable_notification=MUTE_SERVICE_MESSAGES)
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /menu показывает личное якорное меню
     await _show_main_menu_for_user(update, context)
 
 # ==================== РОУТИНГ: клавиатура/колбэки ====================
@@ -819,14 +809,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     await q.answer()
 
-    # Редактируем именно то сообщение, из которого нажали кнопку
     chat_id = q.message.chat.id
     msg_id = q.message.message_id
 
-    # продлим TTL меню при любой навигации
-    owner_key = _find_owner_by_message(chat_id, msg_id)
-    if owner_key:
-        _reset_menu_ttl(context.application, owner_key)
+    # продлеваем TTL для этого меню при любом клике
+    _extend_menu_ttl(chat_id, msg_id)
 
     if data == "menu|main":
         try:
@@ -933,7 +920,12 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"[HOOK] unhandled error: {err}")
 
 # ==================== STARTUP ====================
+app_global: Application  # для TTL-воркера (delete_message)
+
 async def _on_start(app: Application):
+    global app_global
+    app_global = app
+
     # 1) Список видимых команд (латиница; test1 — скрытая)
     await app.bot.set_my_commands([
         BotCommand("today", "📅 Стримы сегодня"),
