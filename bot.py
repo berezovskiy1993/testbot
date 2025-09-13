@@ -75,7 +75,7 @@ LIVE_REMINDER_EVERY_MIN = 60  # период (мин)
 MUTE_SERVICE_MESSAGES = True
 
 # Текст клавиатурной кнопки (широкая)
-KB_LABEL = "👉 Расписание стримов и прочее 👈"
+KB_LABEL = "👉  Расписание стримов и прочее  👈"
 KB_LABEL_LOWER = KB_LABEL.lower()
 
 # TTL меню (сек)
@@ -241,7 +241,7 @@ def _format_today_plain(tasks: List[dict], d: date) -> str:
 
 def _format_table_for_range(tasks: List[dict], start: date, end: date, title: str) -> str:
     m = _tasks_by_date_map(tasks)
-    lines = [html_escape(title), "", "<pre>", "Дата     Дн  Время  Событие", "------- ---- ------ ---------------"]
+    lines = [html_escape(title), "", "<pre>", "Дата     Дн  Время  Событие", "------- ---- ------ ------------"]
     for d in _daterange_days(start, end):
         day = d.strftime("%d.%m")
         wd = _weekday_abr(d)
@@ -481,7 +481,7 @@ async def _announce_with_sources(app: Application, title: str, yt_video: Optiona
     text = (
         "🔴 <b>Стрим начался! Забегай, я тебя жду :)</b>\n\n"
         f"<b>{html_escape(title or '')}</b>\n\n"
-        "#DEKTRIAN #D13 #ОНЛАЙН"
+        "#DEKTRIAN #D13 #СТРИМ"
     )
     await tg_broadcast_photo_first(app, _ids_or_default(ANNOUNCE_CHAT_IDS), text, build_announce_kb(yt_id), photo_url, silent=False)
 
