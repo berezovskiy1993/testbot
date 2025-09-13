@@ -596,10 +596,10 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📅 Сегодня", callback_data="menu|today"),
          InlineKeyboardButton("📅 Неделя",  callback_data="menu|week")],
         [InlineKeyboardButton("📅 Месяц",   callback_data="menu|month"),
-         InlineKeyboardButton("Соцсети",    callback_data="menu|socials")],
+         InlineKeyboardButton("📳 Соцсети",    callback_data="menu|socials")],
         [InlineKeyboardButton("Бронь стрима", callback_data="br|main"),
-         InlineKeyboardButton("Купить юси",   url="https://t.me/uc_pubg_bounty")],
-        [InlineKeyboardButton("Вступить в клан", url="https://t.me/D13_join_bot")],
+         InlineKeyboardButton("💎 Купить юси",   url="https://t.me/uc_pubg_bounty")],
+        [InlineKeyboardButton("🚸 Вступить в клан 🚸", url="https://t.me/D13_join_bot")],
     ])
 
 def _socials_kb() -> InlineKeyboardMarkup:
