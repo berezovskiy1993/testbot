@@ -58,7 +58,7 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/telegram/{BOT_NAME}")
 # Картинка для анонсов стрима (если нет превью YouTube)
 STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
 # Картинка для дневных напоминаний расписания
-SCHEDULE_IMAGE_URL = "https://ibb.co/LXSMV1FQ"
+SCHEDULE_IMAGE_URL = "https://ibb.co/C5YpGnnw"
 
 # Где публикуем анонсы старта и ежечасные напоминания (если пусто — берём CHAT_IDS)
 ANNOUNCE_CHAT_IDS: List[int | str] = []
@@ -66,7 +66,7 @@ ANNOUNCE_CHAT_IDS: List[int | str] = []
 SCHEDULE_REMINDER_CHAT_IDS: List[int | str] = []
 
 # Ежедневные напоминания, локальное время (Europe/Kyiv по TZ_OFFSET_HOURS)
-DAILY_SCHEDULE_TIMES = ["10:00", "14:00"]
+DAILY_SCHEDULE_TIMES = ["12:13", "16:13"]
 
 # Ежечасное «мы всё ещё в эфире»
 LIVE_REMINDER_EVERY_MIN = 60  # период (мин)
@@ -75,7 +75,7 @@ LIVE_REMINDER_EVERY_MIN = 60  # период (мин)
 MUTE_SERVICE_MESSAGES = True
 
 # Текст клавиатурной кнопки (широкая)
-KB_LABEL = "Расписание стримов и прочее"
+KB_LABEL = ":yt: YouTube Расписание стримов и прочее :yt: YouTube"
 KB_LABEL_LOWER = KB_LABEL.lower()
 
 # TTL меню (сек)
