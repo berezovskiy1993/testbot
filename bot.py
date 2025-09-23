@@ -54,16 +54,38 @@ PORT = int(os.getenv("PORT", os.getenv("RENDER_PORT", "8080")))
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "dektrian-secret")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/telegram/{BOT_NAME}")
 
+# >>> Dektrian chat config >>>
+# Публичные теги (строки) для целевых чатов
+STREAM_GROUP_TAG = "@dektrian_tv"        # стримерская группа — все функции
+STREAM_CHANNEL_TAG = "@dektrian_family"   # канал — только анонсы старта
+# Необязательный тег закрытой тест-группы (или оставь в ENV TELEGRAM_CHAT_IDS как есть)
+TEST_CHAT_TAG = os.getenv("TEST_CHAT_TAG", "").strip()
+# <<< Dektrian chat config <<<
+
 # ========= КОНФИГ В КОДЕ =========
 # Картинка для анонсов стрима (если нет превью YouTube)
 STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
 # Картинка для дневных напоминаний расписания
 SCHEDULE_IMAGE_URL = "https://ibb.co/C5YpGnnw"
 
-# Где публикуем анонсы старта и ежечасные напоминания (если пусто — берём CHAT_IDS)
-ANNOUNCE_CHAT_IDS: List[int | str] = []
-# Где публикуем дневные напоминания по расписанию (если пусто — берём CHAT_IDS)
-SCHEDULE_REMINDER_CHAT_IDS: List[int | str] = []
+# >>> Сборка списков чатов для рассылок >>>
+# База чатов для “по умолчанию” (меню/клавиатура рассылаются именно сюда).
+# Всегда включаем стримерскую группу и, если задан, тест-чат, плюс то, что пришло из ENV.
+_base = [STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else []) + CHAT_IDS
+# dedup с сохранением порядка
+CHAT_IDS = list(dict.fromkeys([x for x in _base if x]))
+
+# Где публикуем анонсы старта и ежечасные напоминания
+# (канал + группа + тест, если указан)
+ANNOUNCE_CHAT_IDS: List[int | str] = list(dict.fromkeys(
+    [STREAM_CHANNEL_TAG, STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else [])
+))
+
+# Где публикуем дневные напоминания по расписанию (без канала)
+SCHEDULE_REMINDER_CHAT_IDS: List[int | str] = list(dict.fromkeys(
+    [STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else [])
+))
+# <<< Сборка списков чатов для рассылок <<<
 
 # Ежедневные напоминания, локальное время (Europe/Kyiv по TZ_OFFSET_HOURS)
 DAILY_SCHEDULE_TIMES = ["12:13", "16:13"]
@@ -714,7 +736,8 @@ async def _render_week_text() -> str:
     tasks = _tasks_fetch_all()
     start = now_local().date()
     end = start + timedelta(days=6)
-    return _format_table_for_range(tasks, start, end, f"🗓 Неделя — {start.strftime('%d.%м')}–{end.strftime('%d.%m')}")
+    # фикс формата даты: %m (латинская m), а не кириллическая
+    return _format_table_for_range(tasks, start, end, f"🗓 Неделя — {start.strftime('%d.%m')}–{end.strftime('%d.%m')}")
 
 async def _render_month_text(idx: int | None = None) -> Tuple[str, InlineKeyboardMarkup]:
     tasks = _tasks_fetch_all()
