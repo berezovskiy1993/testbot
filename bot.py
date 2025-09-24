@@ -58,8 +58,8 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/telegram/{BOT_NAME}")
 # Публичные теги (строки) для целевых чатов
 STREAM_GROUP_TAG = "@dektrian_tv"        # стримерская группа — все функции
 STREAM_CHANNEL_TAG = "@dektrian_family"   # канал — только анонсы старта
-# Необязательный тег закрытой тест-группы (или оставь в ENV TELEGRAM_CHAT_IDS как есть)
-TEST_CHAT_TAG = os.getenv("TEST_CHAT_TAG", "").strip()
+# Тег/ID закрытой тест-группы (по умолчанию — твой ID)
+TEST_CHAT_TAG = os.getenv("TEST_CHAT_TAG", "-1001915244120").strip()
 # <<< Dektrian chat config <<<
 
 # ========= КОНФИГ В КОДЕ =========
@@ -69,19 +69,24 @@ STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip(
 SCHEDULE_IMAGE_URL = "https://ibb.co/C5YpGnnw"
 
 # >>> Сборка списков чатов для рассылок >>>
-# База чатов для “по умолчанию” (меню/клавиатура рассылаются именно сюда).
-# Всегда включаем стримерскую группу и, если задан, тест-чат, плюс то, что пришло из ENV.
+# База чатов “по умолчанию” (меню/клавиатура рассылаются именно сюда).
 _base = [STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else []) + CHAT_IDS
 # dedup с сохранением порядка
 CHAT_IDS = list(dict.fromkeys([x for x in _base if x]))
 
-# Где публикуем анонсы старта и ежечасные напоминания
-# (канал + группа + тест, если указан)
+# 1) Реальный анонс старта стрима — канал + группа + тест
 ANNOUNCE_CHAT_IDS: List[int | str] = list(dict.fromkeys(
     [STREAM_CHANNEL_TAG, STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else [])
 ))
-
-# Где публикуем дневные напоминания по расписанию (без канала)
+# 2) Тестовый анонс (/test1) — только тест
+TEST_ANNOUNCE_CHAT_IDS: List[int | str] = list(dict.fromkeys(
+    ([TEST_CHAT_TAG] if TEST_CHAT_TAG else [])
+))
+# 3) Ежечасные напоминания — только группа + тест (канал не включаем)
+LIVE_REMINDER_CHAT_IDS: List[int | str] = list(dict.fromkeys(
+    [STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else [])
+))
+# 4) Дневные напоминания по расписанию — только группа + тест
 SCHEDULE_REMINDER_CHAT_IDS: List[int | str] = list(dict.fromkeys(
     [STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else [])
 ))
@@ -291,6 +296,8 @@ def _daterange_days(start: date, end: date):
         d += timedelta(days=1)
 
 # ==================== YOUTUBE ====================
+_last_youtube_live_id: Optional[str] = None
+
 def _yt_fetch_live_once() -> Optional[dict]:
     global _last_youtube_live_id
     if not (YT_API_KEY and YT_CHANNEL_ID):
@@ -341,10 +348,13 @@ async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int =
         if res:
             return res
         if attempt < max_attempts:
-            await asyncio.sleep(delay_seconds)  # ← гарантированная пауза 10с между попытками
+            await asyncio.sleep(delay_seconds)
     return None
 
 # ==================== TWITCH ====================
+_tw_token: Optional[str] = None
+_tw_token_expire_at: int = 0
+
 def _tw_fetch_token() -> Optional[str]:
     global _tw_token, _tw_token_expire_at
     now_ts = int(time.time())
@@ -505,7 +515,8 @@ async def _announce_with_sources(app: Application, title: str, yt_video: Optiona
         f"<b>{html_escape(title or '')}</b>\n\n"
         "#DEKTRIAN #D13 #СТРИМ"
     )
-    await tg_broadcast_photo_first(app, _ids_or_default(ANNOUNCE_CHAT_IDS), text, build_announce_kb(yt_id), photo_url, silent=False)
+    # Реальный анонс — в канал+группу+тест
+    await tg_broadcast_photo_first(app, ANNOUNCE_CHAT_IDS, text, build_announce_kb(yt_id), photo_url, silent=False)
 
 # ЕЖЕЧАСНЫЕ НАПОМИНАНИЯ ПО ЛАЙВУ
 async def _live_reminder_loop(app: Application):
@@ -517,13 +528,15 @@ async def _live_reminder_loop(app: Application):
             if not twitch_is_live():
                 print("[LIVE-REM] offline detected -> stop")
                 break
+            # удаляем предыдущие напоминания
             for chat_id, mid in list(_live_last_msg_by_chat.items()):
                 try:
                     await app.bot.delete_message(chat_id=chat_id, message_id=mid)
                 except Exception:
                     pass
             kb = build_watch_kb_for_reminder()
-            for chat_id in _ids_or_default(ANNOUNCE_CHAT_IDS):
+            # ВАЖНО: отправляем ТОЛЬКО в LIVE_REMINDER_CHAT_IDS (канала тут нет)
+            for chat_id in LIVE_REMINDER_CHAT_IDS:
                 try:
                     msg = await app.bot.send_message(
                         chat_id=chat_id,
@@ -571,9 +584,10 @@ async def _post_today_schedule_if_any(app: Application):
         return
     text = _format_today_plain(todays, today)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🤙 Вступить в клан", url="https://t.me/D13_join_bot")]])
+    # Дневные — только группа + тест
     await tg_broadcast_photo_first(
         app,
-        _ids_or_default(SCHEDULE_REMINDER_CHAT_IDS),
+        SCHEDULE_REMINDER_CHAT_IDS,
         text,
         kb,
         SCHEDULE_IMAGE_URL,
@@ -601,7 +615,7 @@ async def self_ping():
     if not PUBLIC_URL:
         print("[SELF-PING] skipped: PUBLIC_URL is empty")
         return
-    print(f"[SELF-PING] started; target={PUBLIC_URL}/_wake")
+    print(f"[SELF-PING] started; target={PUBLIC_URL}/_wake}")
     while True:
         try:
             async with aiohttp.ClientSession() as session:
@@ -761,7 +775,7 @@ async def _show_main_menu_for_user(update: Update, context: ContextTypes.DEFAULT
     user_id = update.effective_user.id
     anchor_key = (chat_id, user_id)
 
-    # 1) удаляем сообщение-триггер пользователя (из клавиатуры) — чтобы не плодить служебку
+    # 1) удаляем сообщение-триггер пользователя (из клавиатуры)
     try:
         if update.effective_message:
             await context.bot.delete_message(chat_id=chat_id, message_id=update.effective_message.message_id)
@@ -790,11 +804,15 @@ async def _show_main_menu_for_user(update: Update, context: ContextTypes.DEFAULT
 
 # ==================== КОМАНДЫ (включая /test1) ====================
 async def cmd_test1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Тестовый анонс — только в TEST_ANNOUNCE_CHAT_IDS
     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
     title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
-    await _announce_with_sources(context.application, title, yt_live)
+    yt_id = yt_live["id"] if yt_live else None
+    photo_url = (yt_live.get("thumb") if yt_live and yt_live.get("thumb") else STATIC_IMAGE_URL)
+    text = f"🔴 <b>{html_escape(title)}</b>\n\n#TEST #D13"
+    await tg_broadcast_photo_first(context.application, TEST_ANNOUNCE_CHAT_IDS, text, build_announce_kb(yt_id), photo_url, silent=False)
     if update.effective_message:
-        await update.effective_message.reply_text("✅ Тест: отправил анонс.", disable_notification=MUTE_SERVICE_MESSAGES)
+        await update.effective_message.reply_text("✅ Тест: отправил анонс в тест-группу.", disable_notification=MUTE_SERVICE_MESSAGES)
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _ensure_tasks_env(update):
