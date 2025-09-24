@@ -615,7 +615,7 @@ async def self_ping():
     if not PUBLIC_URL:
         print("[SELF-PING] skipped: PUBLIC_URL is empty")
         return
-    print(f"[SELF-PING] started; target={PUBLIC_URL}/_wake}")
+    print(f"[SELF-PING] started; target={PUBLIC_URL}/_wake")
     while True:
         try:
             async with aiohttp.ClientSession() as session:
