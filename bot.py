@@ -66,7 +66,7 @@ TEST_CHAT_TAG = os.getenv("TEST_CHAT_TAG", "-1001915244120").strip()
 # Картинка для анонсов стрима (если нет превью YouTube)
 STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
 # Картинка для дневных напоминаний расписания
-SCHEDULE_IMAGE_URL = "https://ibb.co/ymg9vTnT"
+SCHEDULE_IMAGE_URL = "https://ibb.co/dsky513D"
 
 # >>> Сборка списков чатов для рассылок >>>
 # База чатов “по умолчанию” (меню/клавиатура рассылаются именно сюда).
