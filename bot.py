@@ -93,7 +93,7 @@ SCHEDULE_REMINDER_CHAT_IDS: List[int | str] = list(dict.fromkeys(
 # <<< Сборка списков чатов для рассылок <<<
 
 # Ежедневные напоминания, локальное время (Europe/Kyiv по TZ_OFFSET_HOURS)
-DAILY_SCHEDULE_TIMES = ["12:13", "16:13"]
+DAILY_SCHEDULE_TIMES = ["12:13"]
 
 # Ежечасное «мы всё ещё в эфире»
 LIVE_REMINDER_EVERY_MIN = 60  # период (мин)
