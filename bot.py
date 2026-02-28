@@ -249,7 +249,8 @@ def _tasks_by_date_map(tasks: List[dict]) -> Dict[date, List[dict]]:
     return out
 
 def _weekday_abr(d: date) -> str:
-    return d.strftime("%a")
+    ru_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    return ru_days[d.weekday()]
 
 def _format_today_plain(tasks: List[dict], d: date) -> str:
     header = f"📅 Стримы сегодня — {d.strftime('%d.%m.%Y')}"
