@@ -8,7 +8,6 @@ from typing import Dict, Tuple, List, Optional
 
 import requests
 import aiohttp
-from aiohttp import web
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -56,36 +55,57 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "dektrian-secret")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"/telegram/{BOT_NAME}")
 
 # >>> Dektrian chat config >>>
-STREAM_GROUP_TAG = "@dektrian_tv"
-STREAM_CHANNEL_TAG = "@dektrian_family"
+# Публичные теги (строки) для целевых чатов
+STREAM_GROUP_TAG = "@dektrian_tv"        # стримерская группа — все функции
+STREAM_CHANNEL_TAG = "@dektrian_family"   # канал — только анонсы старта
+# Тег/ID закрытой тест-группы (по умолчанию — твой ID)
 TEST_CHAT_TAG = os.getenv("TEST_CHAT_TAG", "-1001915244120").strip()
 # <<< Dektrian chat config <<<
 
 # ========= КОНФИГ В КОДЕ =========
+# Картинка для анонсов стрима (если нет превью YouTube)
 STATIC_IMAGE_URL = os.getenv("POST_IMAGE_URL", "https://ibb.co/V0RPnFx1").strip()
+# Картинка для дневных напоминаний расписания
 SCHEDULE_IMAGE_URL = "https://ibb.co/dsky513D"
 
+# >>> Сборка списков чатов для рассылок >>>
+# База чатов “по умолчанию” (меню/клавиатура рассылаются именно сюда).
 _base = [STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else []) + CHAT_IDS
+# dedup с сохранением порядка
 CHAT_IDS = list(dict.fromkeys([x for x in _base if x]))
 
+# 1) Реальный анонс старта стрима — канал + группа + тест
 ANNOUNCE_CHAT_IDS: List[int | str] = list(dict.fromkeys(
     [STREAM_CHANNEL_TAG, STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else [])
 ))
+# 2) Тестовый анонс (/test1) — только тест
 TEST_ANNOUNCE_CHAT_IDS: List[int | str] = list(dict.fromkeys(
     ([TEST_CHAT_TAG] if TEST_CHAT_TAG else [])
 ))
+# 3) Ежечасные напоминания — только группа + тест (канал не включаем)
 LIVE_REMINDER_CHAT_IDS: List[int | str] = list(dict.fromkeys(
     [STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else [])
 ))
+# 4) Дневные напоминания по расписанию — только группа + тест
 SCHEDULE_REMINDER_CHAT_IDS: List[int | str] = list(dict.fromkeys(
     [STREAM_GROUP_TAG] + ([TEST_CHAT_TAG] if TEST_CHAT_TAG else [])
 ))
+# <<< Сборка списков чатов для рассылок <<<
 
+# Ежедневные напоминания, локальное время (Europe/Kyiv по TZ_OFFSET_HOURS)
 DAILY_SCHEDULE_TIMES = ["12:13"]
-LIVE_REMINDER_EVERY_MIN = 60
+
+# Ежечасное «мы всё ещё в эфире»
+LIVE_REMINDER_EVERY_MIN = 60  # период (мин)
+
+# Тихие сервисные сообщения (меню/навигация/клавиатура)
 MUTE_SERVICE_MESSAGES = True
+
+# Текст клавиатурной кнопки (широкая)
 KB_LABEL = "👉  Расписание стримов и прочее  👈"
 KB_LABEL_LOWER = KB_LABEL.lower()
+
+# TTL меню (сек)
 MENU_TTL_SECONDS = 15 * 60
 
 # ========= In-memory state =========
@@ -94,13 +114,17 @@ _tw_token: Optional[str] = None
 _tw_token_expire_at: int = 0
 _last_called_ts = {"tw": 0}
 
+# Личное якорное меню: (chat_id, user_id) -> message_id
 _user_menu_anchor: Dict[Tuple[int, int], int] = {}
+# Таймеры на удаление меню: (chat_id, message_id) -> task
 _menu_timers: Dict[Tuple[int, int], asyncio.Task] = {}
 
+# Ежечасные напоминания по лайву
 _live_reminder_task: Optional[asyncio.Task] = None
 _live_last_msg_by_chat: Dict[int | str, int] = {}
 _last_youtube_live_id: Optional[str] = None
 
+# Антидубль для дневных напоминаний
 _posted_daily_keys: set[str] = set()
 
 # ==================== УТИЛИТЫ ====================
@@ -121,9 +145,23 @@ def main_reply_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([[KeyboardButton(KB_LABEL)]],
                                resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
 
+async def _send_service_message(app: Application, chat_id: int | str, text: str,
+                                reply_markup=None) -> Optional[Message]:
+    try:
+        return await app.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+            disable_notification=MUTE_SERVICE_MESSAGES,
+        )
+    except Exception as e:
+        print(f"[SERVICE] send failed to {chat_id}: {e}")
+        return None
+
 # ==================== GOOGLE TASKS ====================
 def _tasks_get_access_token() -> Optional[str]:
     if not (GOOGLE_TASKS_CLIENT_ID and GOOGLE_TASKS_CLIENT_SECRET and GOOGLE_TASKS_REFRESH_TOKEN and GOOGLE_TASKS_LIST_ID):
+        print("[TASKS] Missing env: CLIENT_ID/SECRET/REFRESH_TOKEN/LIST_ID")
         return None
     try:
         r = requests.post(
@@ -259,6 +297,8 @@ def _daterange_days(start: date, end: date):
         d += timedelta(days=1)
 
 # ==================== YOUTUBE ====================
+_last_youtube_live_id: Optional[str] = None
+
 def _yt_fetch_live_once() -> Optional[dict]:
     global _last_youtube_live_id
     if not (YT_API_KEY and YT_CHANNEL_ID):
@@ -292,13 +332,20 @@ def _yt_fetch_live_once() -> Optional[dict]:
                     thumb_url = thumbs[k]["url"]
                     break
         return {"id": video_id, "title": yt_title, "thumb": thumb_url}
+    except requests.HTTPError as e:
+        code = getattr(e.response, "status_code", "?")
+        try:
+            body = e.response.json()
+        except Exception:
+            body = getattr(e.response, "text", "")
+        print(f"[YT] HTTP {code}: {body}")
     except Exception as e:
         print(f"[YT] error: {e}")
     return None
 
 async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int = 10) -> Optional[dict]:
     for attempt in range(1, max_attempts + 1):
-        res = await asyncio.to_thread(_yt_fetch_live_once)
+        res = _yt_fetch_live_once()
         if res:
             return res
         if attempt < max_attempts:
@@ -306,6 +353,9 @@ async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int =
     return None
 
 # ==================== TWITCH ====================
+_tw_token: Optional[str] = None
+_tw_token_expire_at: int = 0
+
 def _tw_fetch_token() -> Optional[str]:
     global _tw_token, _tw_token_expire_at
     now_ts = int(time.time())
@@ -322,18 +372,28 @@ def _tw_fetch_token() -> Optional[str]:
         _tw_token = data["access_token"]
         _tw_token_expire_at = now_ts + int(data.get("expires_in", 3600))
         return _tw_token
+    except requests.HTTPError as e:
+        print(f"[TW] token HTTP {getattr(e.response, 'status_code', '?')}: {getattr(e.response, 'text', '')}")
+        _tw_token = None
+        _tw_token_expire_at = 0
     except Exception as e:
+        print(f"[TW] token error: {e}")
         _tw_token = None
         _tw_token_expire_at = 0
     return None
 
 def twitch_check_live() -> Optional[dict]:
+    """
+    Возвращает {'id': stream_id, 'title': title} если обнаружен НОВЫЙ эфир, иначе None.
+    """
     global last_twitch_stream_id
     if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and TWITCH_USERNAME):
         return None
+
     tk = _tw_fetch_token()
     if not tk:
         return None
+
     def _call() -> Optional[dict]:
         r = requests.get(
             "https://api.twitch.tv/helix/streams",
@@ -351,6 +411,7 @@ def twitch_check_live() -> Optional[dict]:
         if sid and sid != last_twitch_stream_id:
             return {"id": sid, "title": title}
         return None
+
     try:
         res = _call()
         if res:
@@ -366,10 +427,14 @@ def twitch_check_live() -> Optional[dict]:
                 if res:
                     last_twitch_stream_id = res["id"]
                 return res
-            except Exception:
+            except Exception as e2:
+                print(f"[TW] retry failed: {e2}")
                 return None
-    except Exception:
-        pass
+        code = getattr(e.response, "status_code", "?")
+        body = getattr(e.response, "text", "")
+        print(f"[TW] streams HTTP {code}: {body}")
+    except Exception as e:
+        print(f"[TW] error: {e}")
     return None
 
 def twitch_is_live() -> bool:
@@ -388,7 +453,8 @@ def twitch_is_live() -> bool:
         r.raise_for_status()
         data = r.json().get("data", [])
         return bool(data)
-    except Exception:
+    except Exception as e:
+        print(f"[TW] is_live error: {e}")
         return False
 
 # ==================== ПОСТИНГ ====================
@@ -426,10 +492,10 @@ async def tg_broadcast_photo_first(app: Application, chat_ids: List[int | str], 
                 disable_notification=silent,
             )
             continue
-        except BadRequest:
-            pass
-        except Exception:
-            pass
+        except BadRequest as e:
+            print(f"[TG] photo failed for {chat_id}: {e}. Fallback to link.")
+        except Exception as e:
+            print(f"[TG] photo error to {chat_id}: {e}. Fallback to link.")
         try:
             await app.bot.send_message(
                 chat_id=chat_id,
@@ -439,8 +505,8 @@ async def tg_broadcast_photo_first(app: Application, chat_ids: List[int | str], 
                 disable_notification=silent,
                 disable_web_page_preview=False,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[TG] message send error to {chat_id}: {e}")
 
 async def _announce_with_sources(app: Application, title: str, yt_video: Optional[dict]):
     yt_id = yt_video["id"] if yt_video else None
@@ -450,23 +516,27 @@ async def _announce_with_sources(app: Application, title: str, yt_video: Optiona
         f"<b>{html_escape(title or '')}</b>\n\n"
         "#DEKTRIAN #D13 #СТРИМ"
     )
+    # Реальный анонс — в канал+группу+тест
     await tg_broadcast_photo_first(app, ANNOUNCE_CHAT_IDS, text, build_announce_kb(yt_id), photo_url, silent=False)
 
 # ЕЖЕЧАСНЫЕ НАПОМИНАНИЯ ПО ЛАЙВУ
 async def _live_reminder_loop(app: Application):
     global _live_reminder_task
+    print("[LIVE-REM] loop started")
     try:
         while True:
             await asyncio.sleep(max(1, LIVE_REMINDER_EVERY_MIN * 60))
-            is_live = await asyncio.to_thread(twitch_is_live)
-            if not is_live:
+            if not twitch_is_live():
+                print("[LIVE-REM] offline detected -> stop")
                 break
+            # удаляем предыдущие напоминания
             for chat_id, mid in list(_live_last_msg_by_chat.items()):
                 try:
                     await app.bot.delete_message(chat_id=chat_id, message_id=mid)
                 except Exception:
                     pass
             kb = build_watch_kb_for_reminder()
+            # ВАЖНО: отправляем ТОЛЬКО в LIVE_REMINDER_CHAT_IDS (канала тут нет)
             for chat_id in LIVE_REMINDER_CHAT_IDS:
                 try:
                     msg = await app.bot.send_message(
@@ -476,11 +546,12 @@ async def _live_reminder_loop(app: Application):
                         disable_notification=False,
                     )
                     _live_last_msg_by_chat[chat_id] = msg.message_id
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[LIVE-REM] send error to {chat_id}: {e}")
     finally:
         _live_reminder_task = None
         _live_last_msg_by_chat.clear()
+        print("[LIVE-REM] loop finished")
 
 def _start_live_reminders_if_needed(app: Application):
     global _live_reminder_task
@@ -490,6 +561,7 @@ def _start_live_reminders_if_needed(app: Application):
 
 # ДНЕВНЫЕ НАПОМИНАНИЯ РАСПИСАНИЯ
 async def _daily_schedule_loop(app: Application):
+    print("[DAILY] loop started")
     while True:
         try:
             now = now_local()
@@ -500,45 +572,59 @@ async def _daily_schedule_loop(app: Application):
                     _posted_daily_keys.add(key)
                     await _post_today_schedule_if_any(app)
             await asyncio.sleep(30)
-        except Exception:
+        except Exception as e:
+            print(f"[DAILY] loop error: {e}")
             await asyncio.sleep(5)
 
 async def _post_today_schedule_if_any(app: Application):
-    tasks = await asyncio.to_thread(_tasks_fetch_all)
+    tasks = _tasks_fetch_all()
     today = now_local().date()
     todays = [t for t in tasks if _due_to_local_date(t.get("due") or "") == today]
     if not todays:
+        print("[DAILY] no streams today -> skip")
         return
     text = _format_today_plain(todays, today)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🤙 Вступить в клан", url="https://t.me/D13_join_bot")]])
-    await tg_broadcast_photo_first(app, SCHEDULE_REMINDER_CHAT_IDS, text, kb, SCHEDULE_IMAGE_URL, silent=False)
+    # Дневные — только группа + тест
+    await tg_broadcast_photo_first(
+        app,
+        SCHEDULE_REMINDER_CHAT_IDS,
+        text,
+        kb,
+        SCHEDULE_IMAGE_URL,
+        silent=False,
+    )
 
 # ==================== ЯДРО: «будильник» ====================
 async def minute_loop(app: Application):
+    print(f"[WAKE] minute loop started at {now_local().isoformat()}")
     while True:
         try:
             if _sec_since(_last_called_ts["tw"]) >= 60:
-                tw = await asyncio.to_thread(twitch_check_live)
+                tw = twitch_check_live()
                 if tw:
                     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
                     title = tw.get("title") or (yt_live.get("title") if yt_live else "Стрим")
                     await _announce_with_sources(app, title, yt_live)
                     _start_live_reminders_if_needed(app)
                 _last_called_ts["tw"] = int(time.time())
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WAKE] loop error: {e}")
         await asyncio.sleep(5)
 
 async def self_ping():
     if not PUBLIC_URL:
+        print("[SELF-PING] skipped: PUBLIC_URL is empty")
         return
+    print(f"[SELF-PING] started; target={PUBLIC_URL}/_wake")
     while True:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"{PUBLIC_URL}/_wake", timeout=10) as resp:
                     _ = await resp.text()
-        except Exception:
-            pass
+                    print(f"[SELF-PING] status={resp.status}")
+        except Exception as e:
+            print(f"[SELF-PING] error: {e}")
         await asyncio.sleep(600)
 
 # ==================== ИНЛАЙН-МЕНЮ ====================
@@ -626,10 +712,12 @@ def _find_anchor_key_by_message(chat_id: int, message_id: int) -> Optional[Tuple
 async def _menu_ttl_worker(chat_id: int, message_id: int):
     try:
         await asyncio.sleep(MENU_TTL_SECONDS)
+        # Стараемся удалить ровно это меню
         try:
             await app_global.bot.delete_message(chat_id=chat_id, message_id=message_id)
         except Exception:
             pass
+        # Чистим якорь, если соответствовал
         ak = _find_anchor_key_by_message(chat_id, message_id)
         if ak:
             _user_menu_anchor.pop(ak, None)
@@ -649,7 +737,8 @@ async def _ensure_tasks_env(update: Optional[Update]) -> bool:
     if not (GOOGLE_TASKS_CLIENT_ID and GOOGLE_TASKS_CLIENT_SECRET and GOOGLE_TASKS_REFRESH_TOKEN and GOOGLE_TASKS_LIST_ID):
         if update and update.effective_message:
             await update.effective_message.reply_text(
-                "❗ Не настроен доступ к Google Tasks. Нужны GOOGLE_TASKS_CLIENT_ID / SECRET / REFRESH_TOKEN / LIST_ID в ENV.",
+                "❗ Не настроен доступ к Google Tasks. "
+                "Нужны GOOGLE_TASKS_CLIENT_ID / SECRET / REFRESH_TOKEN / LIST_ID в ENV.",
                 reply_markup=main_reply_kb(),
                 disable_notification=MUTE_SERVICE_MESSAGES,
             )
@@ -657,19 +746,20 @@ async def _ensure_tasks_env(update: Optional[Update]) -> bool:
     return True
 
 async def _render_today_text() -> str:
-    tasks = await asyncio.to_thread(_tasks_fetch_all)
+    tasks = _tasks_fetch_all()
     d = now_local().date()
     todays = [t for t in tasks if _due_to_local_date(t.get("due") or "") == d]
     return _format_today_plain(todays, d)
 
 async def _render_week_text() -> str:
-    tasks = await asyncio.to_thread(_tasks_fetch_all)
+    tasks = _tasks_fetch_all()
     start = now_local().date()
     end = start + timedelta(days=6)
+    # фикс формата даты: %m (латинская m), а не кириллическая
     return _format_table_for_range(tasks, start, end, f"🗓 Неделя — {start.strftime('%d.%m')}–{end.strftime('%d.%m')}")
 
 async def _render_month_text(idx: int | None = None) -> Tuple[str, InlineKeyboardMarkup]:
-    tasks = await asyncio.to_thread(_tasks_fetch_all)
+    tasks = _tasks_fetch_all()
     today = now_local().date()
     year, month = today.year, today.month
     weeks = _month_weeks(year, month)
@@ -680,18 +770,20 @@ async def _render_month_text(idx: int | None = None) -> Tuple[str, InlineKeyboar
     kb = _month_kb(f"{year:04d}-{month:02d}", i, len(weeks))
     return text, kb
 
-# ==================== ПОКАЗ МЕНЮ ====================
+# ==================== ПОКАЗ МЕНЮ (персональный, с удалением старого) ====================
 async def _show_main_menu_for_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     anchor_key = (chat_id, user_id)
 
+    # 1) удаляем сообщение-триггер пользователя (из клавиатуры)
     try:
         if update.effective_message:
             await context.bot.delete_message(chat_id=chat_id, message_id=update.effective_message.message_id)
     except Exception:
         pass
 
+    # 2) если у этого пользователя уже было меню — удалим его и таймер
     old_msg_id = _user_menu_anchor.get(anchor_key)
     if old_msg_id:
         _cancel_menu_timer(chat_id, old_msg_id)
@@ -701,17 +793,19 @@ async def _show_main_menu_for_user(update: Update, context: ContextTypes.DEFAULT
             pass
         _user_menu_anchor.pop(anchor_key, None)
 
+    # 3) создаём новое личное меню (без звука)
     try:
         msg = await context.bot.send_message(chat_id=chat_id, text="Меню бота:",
                                              reply_markup=_main_menu_kb(),
                                              disable_notification=MUTE_SERVICE_MESSAGES)
         _user_menu_anchor[anchor_key] = msg.message_id
         _arm_menu_ttl(chat_id, msg.message_id)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[MENU] send failed: {e}")
 
-# ==================== КОМАНДЫ ====================
+# ==================== КОМАНДЫ (включая /test1) ====================
 async def cmd_test1(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Тестовый анонс — только в TEST_ANNOUNCE_CHAT_IDS
     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
     title = (yt_live.get("title") if yt_live else f"Тестовый пост от {BOT_NAME}")
     yt_id = yt_live["id"] if yt_live else None
@@ -740,12 +834,13 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text, kb = await _render_month_text(0)
     if update.effective_message:
-        await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb, disable_notification=MUTE_SERVICE_MESSAGES)
+        await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb,
+                                                  disable_notification=MUTE_SERVICE_MESSAGES)
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _show_main_menu_for_user(update, context)
 
-# ==================== РОУТИНГ ====================
+# ==================== РОУТИНГ: клавиатура/колбэки ====================
 async def on_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message or not update.effective_message.text:
         return
@@ -762,14 +857,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = q.message.chat.id
     msg_id = q.message.message_id
+
+    # продлеваем TTL для этого меню при любом клике
     _extend_menu_ttl(chat_id, msg_id)
 
     if data == "menu|main":
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
                                                 text="Меню бота:", reply_markup=_main_menu_kb())
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[CB] menu|main edit err: {e}")
         return
 
     if data == "menu|today":
@@ -779,9 +876,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
                                                 text=text, parse_mode="HTML",
-                                                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Меню", callback_data="menu|main")]]))
-        except Exception:
-            pass
+                                                reply_markup=InlineKeyboardMarkup(
+                                                    [[InlineKeyboardButton("← Меню", callback_data="menu|main")]]
+                                                ))
+        except Exception as e:
+            print(f"[CB] today edit err: {e}")
         return
 
     if data == "menu|week":
@@ -791,9 +890,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
                                                 text=text, parse_mode="HTML",
-                                                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("← Меню", callback_data="menu|main")]]))
-        except Exception:
-            pass
+                                                reply_markup=InlineKeyboardMarkup(
+                                                    [[InlineKeyboardButton("← Меню", callback_data="menu|main")]]
+                                                ))
+        except Exception as e:
+            print(f"[CB] week edit err: {e}")
         return
 
     if data == "menu|month":
@@ -803,18 +904,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
                                                 text=text, parse_mode="HTML", reply_markup=kb)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[CB] month edit err: {e}")
         return
 
-    if data.startswith("m|"): 
+    if data.startswith("m|"):  # навигация по неделям месяца
         try:
             _, ym, idx_str = data.split("|")
             year, month = map(int, ym.split("-"))
             idx = int(idx_str)
         except Exception:
             return
-        tasks = await asyncio.to_thread(_tasks_fetch_all)
+        tasks = _tasks_fetch_all()
         weeks = _month_weeks(year, month)
         if not weeks:
             return
@@ -825,32 +926,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
                                                 text=text, parse_mode="HTML", reply_markup=kb)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[CB] m| edit err: {e}")
         return
 
     if data == "menu|socials":
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
                                                 text="Соцсети стримера:", reply_markup=_socials_kb())
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[CB] socials edit err: {e}")
         return
 
     if data == "br|main":
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
                                                 text="Бронь стрима:", reply_markup=_brone_kb())
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[CB] br main err: {e}")
         return
 
     if data == "br|terms":
         try:
             await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
                                                 text=BRONE_TERMS, parse_mode="HTML", reply_markup=_brone_kb())
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[CB] br terms err: {e}")
         return
 
 # ==================== ERROR-HANDLER ====================
@@ -865,12 +966,13 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"[HOOK] unhandled error: {err}")
 
 # ==================== STARTUP ====================
-app_global: Application
+app_global: Application  # для TTL-воркера (delete_message)
 
 async def _on_start(app: Application):
     global app_global
     app_global = app
 
+    # 1) Список видимых команд (латиница; test1 — скрытая)
     await app.bot.set_my_commands([
         BotCommand("today", "📅 Стримы сегодня"),
         BotCommand("week",  "🗓 Стримы на неделю"),
@@ -878,6 +980,7 @@ async def _on_start(app: Application):
         BotCommand("menu",  "Открыть меню"),
     ])
 
+    # 2) Показать клавиатуру тихим сервисным сообщением (чтобы закрепилась у всех)
     for chat_id in _ids_or_default([]):
         try:
             await app.bot.send_message(
@@ -886,20 +989,21 @@ async def _on_start(app: Application):
                 reply_markup=main_reply_kb(),
                 disable_notification=MUTE_SERVICE_MESSAGES,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[STARTED] cannot show keyboard in {chat_id}: {e}")
 
+    # 3) Фоновые задачи
     asyncio.create_task(minute_loop(app))
     asyncio.create_task(self_ping())
     asyncio.create_task(_daily_schedule_loop(app))
     print(f"[STARTED] {BOT_NAME} at {now_local().isoformat()}")
 
-# ==================== APP MAIN ====================
-async def start_bot():
+# ==================== APP ====================
+def main():
     if not TG_TOKEN or not CHAT_IDS:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS in Environment")
     if not PUBLIC_URL:
-        raise SystemExit("Set PUBLIC_URL (https://<your-host>) for webhook")
+        raise SystemExit("Set PUBLIC_URL (https://<your-host>) for webhook (или используйте RENDER_EXTERNAL_URL)")
 
     application = (
         Application.builder()
@@ -908,52 +1012,33 @@ async def start_bot():
         .build()
     )
 
+    # Команды (test1 — скрытая)
     application.add_handler(CommandHandler("test1", cmd_test1))
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CommandHandler("week",  cmd_week))
     application.add_handler(CommandHandler("month", cmd_month))
     application.add_handler(CommandHandler("menu",  cmd_menu))
+
+    # Клавиатурная кнопка
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_buttons))
+
+    # Callback-кнопки
     application.add_handler(CallbackQueryHandler(on_callback))
+
     application.add_error_handler(on_error)
 
     webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
-    
-    # 1. Настройка Webhook для Telegram
-    await application.bot.set_webhook(
-        url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=True
-    )
-    
-    # 2. Инициализация и запуск контекста Telegram бота
-    await application.initialize()
-    await application.start()
-
-    # 3. Настройка кастомного веб-сервера aiohttp для Webhook и Render Health Check
-    web_app = web.Application()
-
-    async def health_check(request):
-        return web.Response(text="OK - Dektrian Bot is alive", status=200)
-
-    # Вебхук для Телеграма
-    web_app.router.add_post(WEBHOOK_PATH, application.create_webhook_handler())
-    # Маршруты для Render (Health Check и пинг)
-    web_app.router.add_get("/", health_check)
-    web_app.router.add_get("/_wake", health_check)
-
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-
     print(f"[WEBHOOK] listen 0.0.0.0:{PORT}  path={WEBHOOK_PATH}  url={webhook_url}")
 
-    # Блокировка, чтобы сервер не закрывался
-    await asyncio.Event().wait()
-
-def main():
-    asyncio.run(start_bot())
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        allowed_updates=None,
+    )
 
 if __name__ == "__main__":
     main()
