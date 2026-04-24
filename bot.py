@@ -345,7 +345,7 @@ def _yt_fetch_live_once() -> Optional[dict]:
 
 async def yt_fetch_live_with_retries(max_attempts: int = 3, delay_seconds: int = 10) -> Optional[dict]:
     for attempt in range(1, max_attempts + 1):
-        res = _yt_fetch_live_once()
+        res = await asyncio.to_thread(_yt_fetch_live_once)
         if res:
             return res
         if attempt < max_attempts:
@@ -526,7 +526,7 @@ async def _live_reminder_loop(app: Application):
     try:
         while True:
             await asyncio.sleep(max(1, LIVE_REMINDER_EVERY_MIN * 60))
-            if not twitch_is_live():
+            if not await asyncio.to_thread(twitch_is_live):
                 print("[LIVE-REM] offline detected -> stop")
                 break
             # удаляем предыдущие напоминания
@@ -577,7 +577,7 @@ async def _daily_schedule_loop(app: Application):
             await asyncio.sleep(5)
 
 async def _post_today_schedule_if_any(app: Application):
-    tasks = _tasks_fetch_all()
+    tasks = await asyncio.to_thread(_tasks_fetch_all)
     today = now_local().date()
     todays = [t for t in tasks if _due_to_local_date(t.get("due") or "") == today]
     if not todays:
@@ -601,7 +601,7 @@ async def minute_loop(app: Application):
     while True:
         try:
             if _sec_since(_last_called_ts["tw"]) >= 60:
-                tw = twitch_check_live()
+                tw = await asyncio.to_thread(twitch_check_live)
                 if tw:
                     yt_live = await yt_fetch_live_with_retries(max_attempts=3, delay_seconds=10)
                     title = tw.get("title") or (yt_live.get("title") if yt_live else "Стрим")
@@ -616,15 +616,15 @@ async def self_ping():
     if not PUBLIC_URL:
         print("[SELF-PING] skipped: PUBLIC_URL is empty")
         return
-    print(f"[SELF-PING] started; target={PUBLIC_URL}/_wake")
+    print(f"[SELF-PING] started (тихий режим, логи отключены)")
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"{PUBLIC_URL}/_wake", timeout=10) as resp:
-                    _ = await resp.text()
-                    print(f"[SELF-PING] status={resp.status}")
-        except Exception as e:
-            print(f"[SELF-PING] error: {e}")
+                # Отправляем тихий GET запрос на корень, чтобы Рендер не спал
+                async with session.get(PUBLIC_URL, timeout=10) as resp:
+                    pass
+        except Exception:
+            pass
         await asyncio.sleep(600)
 
 # ==================== ИНЛАЙН-МЕНЮ ====================
@@ -746,20 +746,20 @@ async def _ensure_tasks_env(update: Optional[Update]) -> bool:
     return True
 
 async def _render_today_text() -> str:
-    tasks = _tasks_fetch_all()
+    tasks = await asyncio.to_thread(_tasks_fetch_all)
     d = now_local().date()
     todays = [t for t in tasks if _due_to_local_date(t.get("due") or "") == d]
     return _format_today_plain(todays, d)
 
 async def _render_week_text() -> str:
-    tasks = _tasks_fetch_all()
+    tasks = await asyncio.to_thread(_tasks_fetch_all)
     start = now_local().date()
     end = start + timedelta(days=6)
     # фикс формата даты: %m (латинская m), а не кириллическая
     return _format_table_for_range(tasks, start, end, f"🗓 Неделя — {start.strftime('%d.%m')}–{end.strftime('%d.%m')}")
 
 async def _render_month_text(idx: int | None = None) -> Tuple[str, InlineKeyboardMarkup]:
-    tasks = _tasks_fetch_all()
+    tasks = await asyncio.to_thread(_tasks_fetch_all)
     today = now_local().date()
     year, month = today.year, today.month
     weeks = _month_weeks(year, month)
@@ -915,7 +915,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             idx = int(idx_str)
         except Exception:
             return
-        tasks = _tasks_fetch_all()
+        tasks = await asyncio.to_thread(_tasks_fetch_all)
         weeks = _month_weeks(year, month)
         if not weeks:
             return
