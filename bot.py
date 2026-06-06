@@ -635,7 +635,7 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📅 Месяц",   callback_data="menu|month"),
          InlineKeyboardButton("📳 Соцсети",    callback_data="menu|socials")],
         [InlineKeyboardButton("Бронь стрима", callback_data="br|main"),
-         InlineKeyboardButton("💎 Купить юси",   url="https://t.me/EtherealVisionShop")],
+         InlineKeyboardButton("💎 Купить юси",   url="https://t.me/total_shop_uc")],
         [InlineKeyboardButton("🚸 Вступить в клан 🚸", url="https://t.me/D13_join_bot")],
     ])
 
